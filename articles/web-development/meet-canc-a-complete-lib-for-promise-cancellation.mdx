@@ -1,0 +1,328 @@
+---
+title: "Meet canc, a complete lib for promise cancellation"
+slug: "meet-canc-a-complete-lib-for-promise-cancellation"
+description: "Your user types a character in a search field. A request fires. Before that request returns, they type another character. Another request fires. And another. Th..."
+category: "Web Development"
+tags: ["canc", "meet", "web development", "complete"]
+keywords: ["canc", "tech guide", "meet", "web development", "software engineering", "complete", "programming"]
+author: "Lead Frontend & Web Architect"
+publishedAt: "2026-08-06"
+readingTime: "10 min read"
+---
+
+# Meet canc, a complete lib for promise cancellation
+
+## Introduction
+
+Your user types a character in a search field. A request fires. Before that request returns, they type another character. Another request fires. And another. Three requests are now in-flight, but only the latest one matters — the first two are wasted bytes over the wire, orphaned callbacks sitting in the event loop, and potential sources of corrupted UI state when they eventually resolve out of order.
+
+This is the promise cancellation problem. JavaScript's `Promise` has no built-in mechanism to say "stop." `AbortController` exists for `fetch`, but it doesn't compose cleanly across arbitrary async work — timers, custom async generators, chained transformations, worker messages. You end up duct-taping `AbortSignal` checks into every function manually.
+
+Enter **canc** — a lightweight library that gives every promise a proper off-switch. It ships as a single module, costs under 2 KB gzipped, has zero runtime dependencies, and provides three composable primitives: `Canceller`, `Token`, and `Scope`. In this article, I'll walk through why this matters, how the internals work, and how to use it in real production scenarios.
+
+## Why This Matters
+
+Here's what happens when you ignore cancellation in async-heavy applications:
+
+**Wasted bandwidth.** Stale HTTP requests consume TCP connections, server resources, and cellular data — all for results that will never render. In a real-time dashboard polling every two seconds, uncanceled requests can easily triple your outbound traffic.
+
+**Memory leaks from orphaned callbacks.** When a component unmounts (think React, Svelte, or Vue teardown) but an in-flight promise still holds a reference to that component's closure, the garbage collector can't reclaim it. Over time, this adds up. We once traced a 40 MB memory growth over 20 minutes in a trading dashboard to exactly this pattern — uncanceled WebSocket message handlers attached to a destroyed view.
+
+**Race conditions on shared state.** When two async operations resolve out of order, the last one doesn't necessarily win. The earlier resolver might overwrite the newer result, leaving your application in an inconsistent state. Without cancellation, you're forced into complex mutex or timestamp-based arbitration logic.
+
+Historically, `AbortController` solved the `fetch` problem elegantly. But it's scoped to the fetch API and doesn't propagate through custom async chains. Libraries like `ky` and `axios` added their own cancellation tokens, but these are siloed — a `ky` cancellation token can't cancel a `setTimeout` or a custom async generator. What's missing is a unified, framework-agnostic cancellation primitive that works across the entire promise lifecycle.
+
+That's exactly what `canc` provides.
+
+## How It Works
+
+At its core, `canc` implements a publish-subscribe pattern over a shared cancellation token. When a `Canceller` triggers cancellation, it broadcasts a signal to every `Token` it has issued. Each `Token` notifies its registered listeners synchronously, allowing cleanup handlers to fire immediately.
+
+The library is built around three layers:
+
+1. **Authority layer (`Canceller`)** — the source of truth for cancellation state. Only one canceller per cancellation domain.
+2. **Propagation layer (`Token`)** — a lightweight, passable reference that any async function can inspect or subscribe to.
+3. **Composition layer (`Scope`)** — a batch manager that groups tokens, tracks in-flight promises, and runs cleanup hooks as a unit.
+
+Here's the architecture visualized:
+
+```mermaid
+flowchart TD
+    subgraph "Application Layer"
+        UI[User Interaction / Component Lifecycle]
+        SCOPE[Scope: Batch & Track]
+    end
+
+    subgraph "canc Library"
+        CANCELLER[Canceller: Source of Truth]
+        TOKEN_1[Token A]
+        TOKEN_2[Token B]
+        TOKEN_3[Token C]
+    end
+
+    subgraph "Async Operations"
+        FETCH_1[fetch / HTTP Request]
+        FETCH_2[setInterval Polling]
+        FETCH_3[Custom Async Generator]
+    end
+
+    UI -->|createScope| SCOPE
+    SCOPE -->|scope.token| CANCELLER
+    CANCELLER -->|issues| TOKEN_1
+    CANCELLER -->|issues| TOKEN_2
+    CANCELLER -->|issues| TOKEN_3
+
+    TOKEN_1 -->|signal| FETCH_1
+    TOKEN_2 -->|signal| FETCH_2
+    TOKEN_3 -->|signal| FETCH_3
+
+    TOKEN_1 -->|onCancel callback| CLEANUP_1[clearInterval / abort]
+    TOKEN_2 -->|onCancel callback| CLEANUP_2[abort generator]
+    TOKEN_3 -->|onCancel callback| CLEANUP_3[release lock]
+
+    UI -->|cancel()| CANCELLER
+    CANCELLER -->|broadcast| TOKEN_1
+    CANCELLER -->|broadcast| TOKEN_2
+    CANCELLER -->|broadcast| TOKEN_3
+
+    style CANCELLER fill:#f9f,stroke:#333,stroke-width:2px
+    style SCOPE fill:#bbf,stroke:#333,stroke-width:2px
+    style TOKEN_1 fill:#dfd,stroke:#333,stroke-width:1px
+    style TOKEN_2 fill:#dfd,stroke:#333,stroke-width:1px
+    style TOKEN_3 fill:#dfd,stroke:#333,stroke-width:1px
+```
+
+The flow works like this:
+
+1. The application creates a `Canceller` (or a `Scope`, which internally manages one).
+2. That canceller issues `Token` instances, which are passed down through the async call chain.
+3. Each async operation checks its token's `isCancelled` flag or registers an `onCancel` cleanup handler.
+4. When `canceller.cancel()` is called, the library flips an internal boolean, iterates over every registered listener, and fires their cleanup callbacks synchronously.
+5. Downstream async functions that check `token.isCancelled` immediately throw or short-circuit.
+
+The critical design decision here is **synchronous notification**. When `cancel()` fires, all `onCancel` callbacks run in the same microtask checkpoint. No waiting for the next tick, no race between cleanup and resolution. This is what makes `canc` reliable where other solutions leave gaps.
+
+## Core Concepts
+
+### Canceller
+
+The `Canceller` is the root authority. It owns the cancellation state (`cancelled: boolean`) and maintains a registry of all tokens it has issued. You create one per logical operation domain — typically per user action, per component lifecycle, or per request batch.
+
+Key properties:
+- `isCancelled` — a boolean reflecting the current state.
+- `cancel()` — flips the state to `true` and notifies all listeners.
+- `token` — a reference to the root `Token` associated with this canceller.
+
+### Token
+
+The `Token` is the propagation vehicle. It's a small object (around 40 bytes) that carries the cancellation state and a list of listener callbacks. You pass tokens through function signatures, store them in closures, attach them to event handlers — wherever you need to check or respond to cancellation.
+
+Key properties:
+- `isCancelled` — mirrors the parent `Canceller`'s state.
+- `onCancel(fn)` — registers a synchronous cleanup callback.
+- `toAbortSignal()` — returns an `AbortSignal` compatible with `fetch` and other standard APIs.
+- `throwIfCancelled()` — throws a `CancellerError` if the token is already cancelled, useful for early-exit guards.
+
+### Scope
+
+The `Scope` wraps a `Canceller` and adds two powerful features: automatic child-token derivation and batch cleanup hooks. A scope creates child tokens that are automatically cancelled when the parent scope is cancelled, forming a tree of cancellation domains. This is invaluable for nested async operations — a parent scope for a page view, child scopes for each widget on that page.
+
+Key properties:
+- `token` — the root token for this scope.
+- `track(promise)` — wraps a promise so it's automatically released from the scope's internal registry when it resolves or rejects.
+- `onCleanup(fn)` — registers a callback that fires when the scope is cancelled, useful for releasing resources like WebSocket connections, file handles, or shared locks.
+- `child()` — creates a new child scope whose cancellation is tied to the parent.
+
+## Examples & Code Walkthrough
+
+### Basic Cancellation Chain
+
+Here's the simplest meaningful example — an async function that fetches data but can be aborted mid-flight:
+
+```javascript
+import { createCanceller } from 'canc';
+
+async function fetchOrderHistory(orderId, token) {
+  token.throwIfCancelled();
+
+  const response = await fetch(`/api/orders/${orderId}`, {
+    signal: token.toAbortSignal(),
+  });
+
+  if (token.isCancelled) {
+    // The fetch resolved, but we no longer care about the result.
+    // Release the response body reader to avoid a memory leak.
+    response.body?.cancel();
+    throw new Error('Operation cancelled before processing');
+  }
+
+  const orders = await response.json();
+  token.throwIfCancelled();
+
+  return orders.map((order) => ({
+    id: order.id,
+    total: order.total_cents / 100,
+    status: order.fulfillment_status,
+  }));
+}
+
+// --- Usage ---
+const { canceller, token } = createCanceller();
+
+// Kick off the fetch
+const historyPromise = fetchOrderHistory('ord_9f3a2b', token);
+
+// User navigates away after 200ms — cancel everything
+setTimeout(() => canceller.cancel(), 200);
+
+try {
+  await historyPromise;
+} catch (err) {
+  if (err.message === 'Operation cancelled before processing') {
+    // Expected path — no error to surface to the user
+    console.log('Fetch cancelled cleanly');
+  } else {
+    // Real error — log and surface
+    console.error(err);
+  }
+}
+```
+
+Notice the pattern of checking `token.isCancelled` at multiple points in the function. This is the most important habit to build: cancellation checks at every `await` boundary. A promise might resolve between two `await` calls, and if you don't check before processing the result, you'll do unnecessary work.
+
+### Propagating Tokens Through Timers and Intervals
+
+Timers are one of the trickiest sources of leaked async work. `setInterval` doesn't care about promises — it just keeps firing. Here's how `canc` handles it:
+
+```javascript
+import { createCanceller } from 'canc';
+
+async function streamPriceUpdates(symbol, token, onPrice) {
+  // Register a cleanup handler that clears the interval on cancel.
+  let intervalId = null;
+  token.onCancel(() => {
+    if (intervalId !== null) {
+      clearInterval(intervalId);
+      intervalId = null;
+    }
+  });
+
+  const poll = async () => {
+    if (token.isCancelled) return;
+
+    try {
+      const res = await fetch(`/api/prices/${symbol}`, {
+        signal: token.toAbortSignal(),
+      });
+      const data = await res.json();
+
+      // Double-check after await — cancellation may have fired during the fetch.
+      if (token.isCancelled) return;
+
+      onPrice(data.last, data.timestamp);
+    } catch (err) {
+      if (token.isCancelled) return; // swallow cancellation errors
+      console.error(`Price poll failed for ${symbol}:`, err.message);
+    }
+  };
+
+  intervalId = setInterval(poll, 1500);
+  poll(); // run immediately on subscribe
+}
+
+// --- Usage ---
+const { canceller, token } = createCanceller();
+streamPriceUpdates('AAPL', token, (price, ts) => {
+  updatePriceWidget('AAPL', price, ts);
+});
+
+// Later, when the component unmounts:
+canceller.cancel(); // clears interval, aborts in-flight fetch
+```
+
+The `onCancel` callback is the key here. Without it, the interval keeps firing forever, and each tick triggers a fetch that will eventually resolve into the void. The cleanup handler ensures the interval is torn down the moment cancellation fires.
+
+### Scoped Cancellation for Batched Operations
+
+When you have multiple independent async operations that should all be cancelled together, `Scope` is the right tool:
+
+```javascript
+import { createScope } from 'canc';
+
+async function loadUserDashboard(scope) {
+  const token = scope.token;
+
+  // Track each promise so the scope knows about them.
+  const profile = scope.track(
+    fetch(`/api/user/profile`, { signal: token.toAbortSignal() }).then((r) => r.json())
+  );
+
+  const permissions = scope.track(
+    fetch(`/api/user/permissions`, { signal: token.toAbortSignal() }).then((r) => r.json())
+  );
+
+  const recentActivity = scope.track(
+    fetch(`/api/user/activity?limit=20`, { signal: token.toAbortSignal() }).then((r) => r.json())
+  );
+
+  // Register a cleanup hook that fires when the scope is cancelled.
+  scope.onCleanup(() => {
+    releaseLocalCache('dashboard');
+    analytics.track('dashboard_aborted', { reason: 'user_navigated_away' });
+  });
+
+  // Wait for all three, but respect cancellation.
+  const [prof, perms, activity] = await Promise.all([profile, permissions, recentActivity]);
+
+  // Final cancellation check before returning.
+  if (token.isCancelled) {
+    throw new Error('Dashboard load cancelled');
+  }
+
+  return { profile: prof, permissions: perms, recentActivity: activity };
+}
+
+// --- Usage ---
+const dashboardScope = createScope();
+loadUserDashboard(dashboardScope).then(renderDashboard).catch((err) => {
+  if (err.message !== 'Dashboard load cancelled') {
+    console.error('Dashboard load failed:', err);
+  }
+});
+
+// User clicks a nav link — cancel the entire dashboard load.
+dashboardScope.cancel(); // aborts all 3 fetches + fires cleanup hook
+```
+
+The `scope.track()` method is particularly useful here. It wraps each promise in a thin wrapper that removes it from the scope's internal registry when it settles (resolves or rejects). This prevents memory accumulation when you create many scopes over the lifetime of a long-running application.
+
+### Composing Scopes with Child Tokens
+
+Scopes form a hierarchy. A parent scope can create child scopes, and cancelling the parent cascades cancellation to all descendants:
+
+```javascript
+import { createScope } from 'canc';
+
+async function loadPage(rootScope) {
+  const header = rootScope.child();
+  const sidebar = rootScope.child();
+  const content = rootScope.child();
+
+  // Each child has its own token, but shares the parent's cancellation root.
+  const headerData = scope.track(fetchHeader(header.token));
+  const sidebarData = scope.track(fetchSidebar(sidebar.token));
+  const contentData = scope.track(fetchContent(content.token));
+
+  // If rootScope.cancel() is called, all three children cancel too.
+  // But you can also cancel individually:
+  sidebar.cancel(); // cancels only sidebar, leaves header and content intact.
+
+  return { header: headerData, sidebar: sidebarData, content: contentData };
+}
+```
+
+This tree structure is what makes `canc` composable. A single page load might have dozens of child scopes for different widgets, each with their own cleanup logic, all governed by a single root scope for the page itself.
+
+## Best Practices
+
+**Always check `token.isCancelled` after every `await`.** This is the single most important rule. A promise can resolve while cancellation is in-flight, and processing that result is wasted work at best and a state corruption source at worst

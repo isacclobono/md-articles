@@ -1,0 +1,389 @@
+---
+title: "Building a Production AI Agent in Spring Boot: The Supervisor Pattern with Specialist Agents (Part 5)"
+slug: "building-a-production-ai-agent-in-spring-boot-the-supervisor-pattern-with-specialist-agents-part-5"
+description: "In Part 4, we built a chain-of-agents orchestration layer where each agent could call tools and pass results downstream. It worked well for linear workflows. Bu..."
+category: "Artificial Intelligence"
+tags: ["agent", "artificial intelligence", "production", "building"]
+keywords: ["agent", "building", "artificial intelligence", "production", "programming", "tech guide", "software engineering"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-08-06"
+readingTime: "10 min read"
+---
+
+# Building a Production AI Agent in Spring Boot: The Supervisor Pattern with Specialist Agents (Part 5)
+
+## Introduction
+
+In Part 4, we built a chain-of-agents orchestration layer where each agent could call tools and pass results downstream. It worked well for linear workflows. But the moment a user's request touched two or more domains — say, a code review that also needed a security vulnerability scan — the single-agent model buckled. One agent tried to be a code reviewer, a security analyst, and a debugger simultaneously. The results were inconsistent, expensive, and frankly embarrassing.
+
+The supervisor pattern solves this. Instead of one agent doing everything, you get a lightweight router that classifies the incoming task, delegates it to a domain specialist, and re-aggregates the response. Think of it like a hospital triage desk: the nurse doesn't perform surgery or set a broken bone. They figure out where the patient needs to go and hand off the case.
+
+By the end of this article, you'll have a Spring Boot application with a routing supervisor, a pool of domain-specific specialist agents, shared context management, and circuit breakers for resilience.
+
+## Why This Matters
+
+I've seen teams burn weeks trying to engineer a single prompt that handles every possible user intent. It doesn't scale. The context window bloats, the token cost climbs, and the hallucination rate goes through the roof because the agent is asked to operate outside its core competency.
+
+Specialization fixes three things at once:
+
+- **Accuracy.** A specialist agent trained on a narrow domain produces fewer hallucinations because its system prompt is tight and its tool set is focused.
+- **Cost.** Shorter, domain-specific prompts mean fewer tokens per call. When you're routing thousands of requests a day, that adds up fast.
+- **Latency.** A routing decision takes milliseconds. A specialist agent with a constrained prompt responds faster than a generalist trying to juggle five domains at once.
+
+This pattern also maps naturally to microservice architecture. If you already have bounded contexts in your domain model, each one maps cleanly to a specialist agent.
+
+## How It Works
+
+The architecture has six core components working in concert. Here's the flow:
+
+```mermaid
+flowchart TD
+    A[Client Request] --> B[ApiGateway<br/>(Spring REST Controller)]
+    B --> C[SupervisorAgent<br/>(Routing Brain)]
+    C --> D[TaskClassifier<br/>(Domain Detection)]
+    D --> E{Domain Known?}
+    E -->|Yes| F[Route to SpecialistAgent<br/>Pool]
+    E -->|No| G[Fallback Specialist<br//>or Generic Agent]
+    F --> H[CodeReviewSpecialist]
+    F --> I[SecurityScanSpecialist]
+    F --> J[DataQuerySpecialist]
+    H --> K[SharedContextStore<br/>(ConcurrentHashMap + TTL)]
+    I --> K
+    J --> K
+    K --> L[ResponseAggregator<br/>(Merge & Format)]
+    L --> M[CircuitBreaker<br//>Per Specialist]
+    M --> N[Unified Response<br/>Back to Client]
+```
+
+Here's what each piece does:
+
+- **`ApiGateway`** — The Spring Boot REST controller. It receives the raw user message, attaches a correlation ID, and hands it to the supervisor.
+- **`SupervisorAgent`** — Stateless and fast. It doesn't do any LLM inference itself. Its job is to coordinate: classify, route, wait for the specialist, aggregate.
+- **`TaskClassifier`** — A lightweight LLM call (or even a keyword-based router for simple domains) that determines which specialist should handle the request. We use a small, fast model for this step to keep overhead minimal.
+- **`SpecialistAgent` pool** — Each specialist owns its system prompt, its tool set, and its scoped memory. They are Spring `@Component` beans, discovered and registered at startup.
+- **`SharedContextStore`** — An in-memory `ConcurrentHashMap` with TTL-based eviction. It holds cross-agent context like user session data, previous tool results, or intermediate findings that multiple specialists might need.
+- **`CircuitBreaker`** — Wraps each specialist call. If a specialist fails repeatedly (timeout, error rate threshold), the circuit opens and requests are routed to a fallback agent or return a graceful error immediately instead of hanging.
+- **`ResponseAggregator`** — Takes the raw specialist output, normalizes it, and merges it into a unified response structure the client can consume.
+
+The critical design decision here is that the supervisor itself never calls the LLM for the actual task work. It only routes. This keeps the supervisor cheap, fast, and predictable.
+
+## Core Concepts
+
+### The Specialist Interface
+
+Every specialist agent implements a common contract. This lets the supervisor treat them uniformly regardless of domain.
+
+```java
+public interface SpecialistAgent {
+    String getDomain();
+    String getSystemPrompt();
+    List<ToolDefinition> getAvailableTools();
+    SpecialistResponse execute(SpecialistRequest request);
+}
+```
+
+The `getDomain()` method returns a string identifier like `"code_review"` or `"security_scan"`. The supervisor uses this to match classified tasks to the right agent. `getSystemPrompt()` returns the specialist's focused instruction set. `getAvailableTools()` declares what tools the specialist can use — and only those tools. `execute()` runs the actual specialist logic.
+
+### The Supervisor Agent
+
+The supervisor is intentionally thin. It doesn't hold conversation state. It doesn't call the LLM for reasoning. It routes, aggregates, and returns.
+
+```java
+@Component
+public class SupervisorAgent {
+
+    private final TaskClassifier classifier;
+    private final Map<String, SpecialistAgent> specialists;
+    private final SharedContextStore contextStore;
+    private final ResponseAggregator aggregator;
+    private final CircuitBreakerRegistry circuitBreakerRegistry;
+
+    public SupervisorAgent(TaskClassifier classifier,
+                           List<SpecialistAgent> specialistList,
+                           SharedContextStore contextStore,
+                           ResponseAggregator aggregator,
+                           CircuitBreakerRegistry circuitBreakerRegistry) {
+        this.classifier = classifier;
+        this.contextStore = contextStore;
+        this.aggregator = aggregator;
+        this.circuitBreakerRegistry = circuitBreakerRegistry;
+        this.specialists = specialistList.stream()
+                .collect(Collectors.toMap(SpecialistAgent::getDomain, Function.identity()));
+    }
+
+    public SupervisorResponse route(SupervisorRequest request) {
+        String domain = classifier.classify(request.userMessage());
+        SpecialistAgent specialist = specialists.get(domain);
+
+        if (specialist == null) {
+            return handleUnrecognizedDomain(request);
+        }
+
+        String correlationId = request.correlationId();
+        contextStore.put(correlationId, "last_domain", domain);
+
+        CircuitBreaker cb = circuitBreakerRegistry.get(domain);
+        SpecialistResponse specialistResponse = cb.run(
+            () -> specialist.execute(toSpecialistRequest(request)),
+            throwable -> handleSpecialistFailure(request, throwable)
+        );
+
+        return aggregator.aggregate(specialistResponse, request);
+    }
+}
+```
+
+Notice the constructor injects a list of all `SpecialistAgent` beans and indexes them by domain. This is Spring's dependency injection doing the heavy lifting — add a new specialist bean and it's automatically registered.
+
+### The Task Classifier
+
+The classifier is the brain's triage desk. For our implementation, we use a small, fast OpenAI model call with a constrained output format:
+
+```java
+@Component
+public class TaskClassifier {
+
+    private static final String CLASSIFICATION_PROMPT = """
+        Classify the following user request into one of these domains:
+        - code_review
+        - security_scan
+        - data_query
+        - general_support
+
+        Respond with ONLY the domain name, nothing else.
+
+        User request: %s
+        """;
+
+    private final OpenAiChatModel chatModel;
+
+    public TaskClassifier(OpenAiChatModel chatModel) {
+        this.chatModel = chatModel;
+    }
+
+    public String classify(String userMessage) {
+        String prompt = CLASSIFICATION_PROMPT.formatted(userMessage);
+        AiResponse response = chatModel.call(prompt);
+        return response.getResult().getOutput().getContent().trim().toLowerCase();
+    }
+}
+```
+
+For production, you might replace this with a keyword-based router for latency-sensitive paths and fall back to the LLM classifier for ambiguous cases. The key constraint is that the classifier must be fast — sub-100ms ideally — since it sits on the critical path for every request.
+
+### The Shared Context Store
+
+Specialists sometimes need to know what happened in a previous step or what the user's session context looks like. The `SharedContextStore` is a simple TTL-backed concurrent map:
+
+```java
+@Component
+public class SharedContextStore {
+
+    private final ConcurrentHashMap<String, ContextEntry> store = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService cleanupScheduler = Executors.newSingleThreadScheduledExecutor();
+
+    public SharedContextStore() {
+        cleanupScheduler.scheduleAtFixedRate(this::evictExpiredEntries, 30, 30, TimeUnit.SECONDS);
+    }
+
+    public void put(String correlationId, String key, Object value) {
+        store.put(buildKey(correlationId, key), new ContextEntry(value, System.currentTimeMillis() + 600_000));
+    }
+
+    public <T> T get(String correlationId, String key, Class<T> type) {
+        ContextEntry entry = store.get(buildKey(correlationId, key));
+        if (entry == null || entry.isExpired()) {
+            return null;
+        }
+        return type.cast(entry.value());
+    }
+
+    private String buildKey(String correlationId, String key) {
+        return correlationId + "::" + key;
+    }
+
+    private void evictExpiredEntries() {
+        long now = System.currentTimeMillis();
+        store.entrySet().removeIf(e -> e.getValue().isExpired(now));
+    }
+
+    record ContextEntry(Object value, long expiryTimestamp) {
+        boolean isExpired() { return isExpired(System.currentTimeMillis()); }
+        boolean isExpired(long now) { return now > expiryTimestamp; }
+    }
+}
+```
+
+The 10-minute TTL keeps memory bounded. The scheduled cleanup runs every 30 seconds, which is a reasonable trade-off between memory pressure and CPU overhead.
+
+## Examples & Code Walkthrough
+
+Let's build out a concrete specialist: the `CodeReviewSpecialist`. This agent focuses exclusively on Java code analysis, thread safety, and resource leak detection.
+
+### The Code Review Specialist
+
+```java
+@Component
+public class CodeReviewSpecialist implements SpecialistAgent {
+
+    private final OpenAiChatModel chatModel;
+    private final CodeAnalysisTool codeAnalysisTool;
+
+    public CodeReviewSpecialist(OpenAiChatModel chatModel,
+                                CodeAnalysisTool codeAnalysisTool) {
+        this.chatModel = chatModel;
+        this.codeAnalysisTool = codeAnalysisTool;
+    }
+
+    @Override
+    public String getDomain() {
+        return "code_review";
+    }
+
+    @Override
+    public String getSystemPrompt() {
+        return """
+            You are a senior Java code reviewer. Analyze the provided code for:
+            1. Thread safety issues (shared mutable state, missing synchronization)
+            2. Resource leak risks (unclosed streams, unclosed connections)
+            3. Null safety gaps
+            4. Concurrency hazards (race conditions, deadlock potential)
+
+            For each issue found, provide:
+            - The file and line number (if available)
+            - A severity level: LOW, MEDIUM, HIGH, CRITICAL
+            - A brief explanation of the risk
+            - A concrete fix suggestion
+
+            Do not provide general programming advice outside the scope of these four categories.
+            """;
+    }
+
+    @Override
+    public List<ToolDefinition> getAvailableTools() {
+        return List.of(
+            new ToolDefinition("analyze_code", "Analyze Java source code for issues", Map.of(
+                "sourceCode", "The Java source code to analyze",
+                "fileName", "The name of the file being reviewed"
+            ))
+        );
+    }
+
+    @Override
+    public SpecialistResponse execute(SpecialistRequest request) {
+        String sourceCode = request.input();
+        String fileName = request.metadata().get("fileName").orElse("Unknown.java");
+
+        AnalysisResult toolResult = codeAnalysisTool.analyze(sourceCode, fileName);
+
+        String prompt = """
+            Review the following code for thread safety, resource leaks, null safety, and concurrency hazards.
+            File: %s
+
+            Code:
+            %s
+
+            Tool analysis result: %s
+            """.formatted(fileName, sourceCode, toolResult.summary());
+
+        AiResponse response = chatModel.call(prompt);
+
+        return new SpecialistResponse(
+            response.getResult().getOutput().getContent(),
+            Map.of("toolAnalysisId", toolResult.id())
+        );
+    }
+}
+```
+
+Notice that the system prompt is tightly scoped to four categories. This is intentional. A generalist prompt would say "review this code" and hope for the best. Our specialist knows exactly what it's looking for.
+
+### The Security Scan Specialist
+
+Here's a second specialist to show the contrast:
+
+```java
+@Component
+public class SecurityScanSpecialist implements SpecialistAgent {
+
+    private final OpenAiChatModel chatModel;
+    private final VulnerabilityScanner vulnerabilityScanner;
+
+    public SecurityScanSpecialist(OpenAiChatModel chatModel,
+                                  VulnerabilityScanner vulnerabilityScanner) {
+        this.chatModel = chatModel;
+        this.vulnerabilityScanner = vulnerabilityScanner;
+    }
+
+    @Override
+    public String getDomain() {
+        return "security_scan";
+    }
+
+    @Override
+    public String getSystemPrompt() {
+        return """
+            You are a security-focused code analyst. Your only concern is identifying security vulnerabilities in the provided code.
+            Check for:
+            1. SQL injection vectors
+            2. Cross-site scripting (XSS) risks
+            3. Insecure deserialization
+            4. Hardcoded secrets or credentials
+            5. Authentication bypass patterns
+
+            For each finding, provide severity (CRITICAL, HIGH, MEDIUM, LOW), location, and a remediation step.
+            """;
+    }
+
+    @Override
+    public List<ToolDefinition> getAvailableTools() {
+        return List.of(
+            new ToolDefinition("scan_vulnerabilities", "Scan code for known vulnerability patterns", Map.of(
+                "sourceCode", "Source code to scan",
+                "dependencies", "Known dependency versions for CVE matching"
+            ))
+        );
+    }
+
+    @Override
+    public SpecialistResponse execute(SpecialistRequest request) {
+        String sourceCode = request.input();
+        VulnerabilityReport report = vulnerabilityScanner.scan(sourceCode);
+
+        String prompt = """
+            Security scan report for the provided code:
+            %s
+
+            Code context:
+            %s
+
+            Identify all vulnerabilities and provide remediation guidance.
+            """.formatted(report.cveMatches(), sourceCode);
+
+        AiResponse response = chatModel.call(prompt);
+        return new SpecialistResponse(response.getResult().getOutput().getContent(),
+            Map.of("vulnerabilityReportId", report.id()));
+    }
+}
+```
+
+The contrast is deliberate. The `CodeReviewSpecialist` looks at thread safety and resource management. The `SecurityScanSpecialist` looks at injection, deserialization, and secrets. Neither agent knows or cares about the other's domain. That's the whole point.
+
+### The Fallback Handler
+
+What happens when a request doesn't match any known specialist? We route it to a lightweight fallback:
+
+```java
+@Component
+public class FallbackSpecialist implements SpecialistAgent {
+
+    private final OpenAiChatModel chatModel;
+
+    public FallbackSpecialist(OpenAiChatModel chatModel) {
+        this.chatModel = chatModel;
+    }
+
+    @Override
+    public String getDomain() {
+        return "__fallback__";
+    }

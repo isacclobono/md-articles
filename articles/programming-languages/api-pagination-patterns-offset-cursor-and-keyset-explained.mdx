@@ -1,0 +1,355 @@
+---
+title: "API Pagination Patterns: Offset, Cursor, and Keyset Explained"
+slug: "api-pagination-patterns-offset-cursor-and-keyset-explained"
+description: "Pagination is the unsung hero of API design – or the villain, depending on how you've felt after debugging a slow admin dashboard at 2 AM. When you're serving t..."
+category: "Programming Languages"
+tags: ["patterns", "programming languages", "pagination", "offset"]
+keywords: ["pagination", "patterns", "software engineering", "offset", "programming languages", "programming", "tech guide"]
+author: "Compiler & Language Architect"
+publishedAt: "2026-08-07"
+readingTime: "12 min read"
+---
+
+# API Pagination Patterns: Offset, Cursor, and Keyset Explained
+
+## Introduction
+
+Pagination is the unsung hero of API design – or the villain, depending on how you've felt after debugging a slow admin dashboard at 2 AM. When you're serving thousands of concurrent users browsing through millions of records, the way you slice and dice your data can mean the difference between a responsive interface and a timeout error page.
+
+I've seen teams ship entire features only to discover their pagination strategy collapses under load. An e-commerce startup once lost 30% of their checkout conversions because product listing pages took 8 seconds to load with large datasets. The culprit? Naive offset-based pagination that was fine in development but choked in production.
+
+This article cuts through the marketing speak to give you the real engineering trade-offs between offset, cursor, and keyset pagination patterns. You'll walk away knowing exactly which approach to reach for in different scenarios, with concrete implementation examples you can adapt immediately.
+
+## Why This Matters
+
+Pagination isn't just about user experience – it's a fundamental constraint that shapes your entire backend architecture. Get it wrong, and you're looking at database connection pool exhaustion, memory leaks, and APIs that can't scale beyond your local test dataset.
+
+The modern web demands real-time data feeds, infinite scroll experiences, and consistent performance regardless of dataset size. Whether you're building a social media timeline, an admin panel with audit logs, or a marketplace with millions of products, pagination directly impacts:
+
+- Database query performance and resource utilization
+- Network bandwidth consumption
+- Client-side rendering efficiency
+- Cache effectiveness
+- Overall system reliability
+
+Most developers learn pagination through trial and error, often discovering too late that their chosen approach doesn't scale. Understanding these patterns upfront saves weeks of refactoring and prevents some truly painful production incidents.
+
+## How It Works
+
+The core challenge in pagination is this: how do you efficiently retrieve a subset of records without scanning or processing data you don't need?
+
+```mermaid
+flowchart TD
+    A[Client Requests Page] --> B{Which Pattern?}
+    B -->|Offset| C[Calculate Offset = (page-1) × limit]
+    B -->|Cursor| D[Decode Cursor Token]
+    B -->|Keyset| E[Extract Last Seen Values]
+    
+    C --> F[SELECT * FROM table ORDER BY col LIMIT limit OFFSET offset]
+    D --> G[SELECT * FROM table WHERE sort_col > cursor_val ORDER BY sort_col LIMIT limit]
+    E --> H[SELECT * FROM table WHERE (col1, col2) > (val1, val2) ORDER BY col1, col2 LIMIT limit]
+    
+    F --> I[Database Scans OFFSET rows, returns LIMIT rows]
+    G --> J[Database uses index, jumps to cursor position]
+    H --> K[Database uses composite index, efficient range scan]
+    
+    I --> L[Response with data + next page info]
+    J --> L
+    K --> L
+```
+
+Each pattern takes a fundamentally different approach to solving the same problem. Offset pagination treats pagination as a mathematical calculation. Cursor pagination encodes position information. Keyset pagination leverages database indexing capabilities directly.
+
+The performance characteristics differ dramatically:
+- **Offset**: O(n + m) where n is offset and m is limit
+- **Cursor**: O(log n + m) using index lookups
+- **Keyset**: O(log n + m) with optimal index usage
+
+## Core Concepts
+
+Before diving into implementations, let's establish the vocabulary:
+
+**Offset** is the zero-based position in your result set where you want to start retrieving records. Page 1 with limit 10 starts at offset 0, page 2 starts at offset 10, and so on.
+
+**Cursor** is an opaque token that represents the position in a result set. It's typically base64-encoded information about the last record from the previous page, allowing the next query to continue from that exact position.
+
+**Keyset** refers to using the actual values from your indexed columns as boundary conditions in WHERE clauses, enabling direct index seeks rather than scans.
+
+**Page size** (or limit) determines how many records to return per request. This affects both user experience and system performance.
+
+**Total count** is the number of records matching your filter criteria. Calculating this accurately can be expensive on large datasets.
+
+## Examples & Code Walkthrough
+
+Let's examine each pattern with practical implementations that handle real-world concerns like error conditions and edge cases.
+
+### Offset-Based Pagination Implementation
+
+```javascript
+// Custom implementation for blog post listing
+app.get('/api/posts', async (req, res) => {
+  const { page = 1, limit = 20 } = req.query;
+  const offset = (page - 1) * limit;
+  
+  try {
+    const posts = await db.query(
+      'SELECT id, title, excerpt, published_at FROM posts WHERE status = $1 ORDER BY published_at DESC LIMIT $2 OFFSET $3',
+      ['published', limit, offset]
+    );
+    
+    const countResult = await db.query(
+      'SELECT COUNT(*) FROM posts WHERE status = $1',
+      ['published']
+    );
+    
+    const totalItems = parseInt(countResult.rows[0].count);
+    const totalPages = Math.ceil(totalItems / limit);
+    
+    res.json({
+      data: posts.rows,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: totalPages,
+        totalItems: totalItems,
+        hasNext: offset + parseInt(limit) < totalItems,
+        hasPrev: offset > 0
+      }
+    });
+  } catch (error) {
+    console.error('Pagination error:', error);
+    res.status(500).json({ error: 'Failed to fetch posts' });
+  }
+});
+```
+
+This approach works well for small datasets, but notice the performance killer: we're executing two queries, and the OFFSET clause forces PostgreSQL to skip through `offset` rows before returning results.
+
+### Cursor-Based Pagination Implementation
+
+```javascript
+// Secure cursor-based pagination for user activity feed
+function generateCursor(userId, timestamp, activityId) {
+  const payload = `${userId}|${timestamp}|${activityId}`;
+  return Buffer.from(payload).toString('base64');
+}
+
+function decodeCursor(cursor) {
+  try {
+    const decoded = Buffer.from(cursor, 'base64').toString('utf8');
+    const parts = decoded.split('|');
+    if (parts.length !== 3) return null;
+    
+    const [userId, timestamp, activityId] = parts;
+    return { 
+      userId: parseInt(userId), 
+      timestamp: new Date(parseInt(timestamp)), 
+      activityId: parseInt(activityId) 
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+app.get('/api/activity', async (req, res) => {
+  const { limit = 25, cursor } = req.query;
+  
+  let query;
+  let params = [req.user.id];
+  
+  if (cursor) {
+    const decodedCursor = decodeCursor(cursor);
+    if (!decodedCursor) {
+      return res.status(400).json({ error: 'Invalid cursor' });
+    }
+    
+    query = `
+      SELECT id, type, metadata, created_at 
+      FROM user_activities 
+      WHERE user_id = $1 
+        AND (created_at < $2 OR (created_at = $2 AND id < $3))
+      ORDER BY created_at DESC, id DESC 
+      LIMIT $4
+    `;
+    params.push(decodedCursor.timestamp, decodedCursor.activityId, parseInt(limit) + 1);
+  } else {
+    query = `
+      SELECT id, type, metadata, created_at 
+      FROM user_activities 
+      WHERE user_id = $1
+      ORDER BY created_at DESC, id DESC 
+      LIMIT $2
+    `;
+    params.push(parseInt(limit) + 1);
+  }
+  
+  try {
+    const activities = await db.query(query, params);
+    const hasNext = activities.rows.length > limit;
+    const results = hasNext ? activities.rows.slice(0, -1) : activities.rows;
+    
+    const nextCursor = hasNext ? generateCursor(
+      req.user.id,
+      results[results.length - 1].created_at.getTime(),
+      results[results.length - 1].id
+    ) : null;
+    
+    res.json({
+      data: results,
+      pagination: { nextCursor, hasNext }
+    });
+  } catch (error) {
+    console.error('Cursor pagination error:', error);
+    res.status(500).json({ error: 'Failed to fetch activities' });
+  }
+});
+```
+
+The cursor pattern shines when you need consistent performance regardless of dataset size. By encoding the exact position, we eliminate the need for COUNT queries and avoid the offset scanning penalty.
+
+### Keyset Pagination Implementation
+
+```javascript
+// Express route implementing keyset pagination for product search
+app.get('/api/products', async (req, res) => {
+  const { limit = 30, after = null, category = null } = req.query;
+  
+  let query;
+  let params;
+  
+  try {
+    if (after) {
+      // Keyset pagination with composite index
+      const [cat, price, id] = after.split('|');
+      query = `
+        SELECT id, name, price, category, stock_quantity 
+        FROM products 
+        WHERE category = $1
+          AND (category, price, id) > ($2, $3, $4)
+        ORDER BY category ASC, price ASC, id ASC
+        LIMIT $5
+      `;
+      params = [category || cat, category || cat, parseFloat(price), parseInt(id), parseInt(limit) + 1];
+    } else if (category) {
+      query = `
+        SELECT id, name, price, category, stock_quantity 
+        FROM products 
+        WHERE category = $1
+        ORDER BY category ASC, price ASC, id ASC
+        LIMIT $2
+      `;
+      params = [category, parseInt(limit) + 1];
+    } else {
+      query = `
+        SELECT id, name, price, category, stock_quantity 
+        FROM products 
+        ORDER BY category ASC, price ASC, id ASC
+        LIMIT $1
+      `;
+      params = [parseInt(limit) + 1];
+    }
+    
+    const products = await db.query(query, params);
+    const hasNext = products.rows.length > limit;
+    const results = hasNext ? products.rows.slice(0, -1) : products.rows;
+    
+    const nextToken = hasNext ? 
+      `${results[results.length - 1].category}|${results[results.length - 1].price}|${results[results.length - 1].id}` : 
+      null;
+    
+    res.json({
+      data: results,
+      pagination: { nextToken, hasNext }
+    });
+  } catch (error) {
+    console.error('Keyset pagination error:', error);
+    res.status(500).json({ error: 'Failed to fetch products' });
+  }
+});
+```
+
+Keyset pagination requires careful consideration of your sort order and indexing strategy. The composite index on `(category, price, id)` enables the database to jump directly to the starting position for each page.
+
+## Best Practices
+
+1. **Always index your sorting columns** – Without proper indexes, even cursor and keyset pagination will degrade to full table scans.
+
+2. **Use deterministic ordering** – Ensure your ORDER BY clause includes a unique column (like ID) as the final sort key to prevent duplicate or missing records.
+
+3. **Validate cursor/token integrity** – Never trust client-provided pagination tokens. Always verify they contain valid, expected values.
+
+4. **Consider cursor expiration** – For long-lived cursors, implement expiration mechanisms to prevent stale data issues.
+
+5. **Handle empty result sets gracefully** – Return appropriate pagination metadata even when no results are found.
+
+6. **Be consistent with direction** – Stick to either forward-only or bidirectional pagination throughout your API to avoid complex client-side logic.
+
+## Common Mistakes & Anti-Patterns
+
+**Mistake 1: Using OFFSET for large datasets**
+The classic anti-pattern is using `LIMIT/OFFSET` with high offset values. At offset 100,000 with limit 20, the database still processes and discards the first 100,000 rows. This becomes exponentially worse as you paginate deeper.
+
+**Mistake 2: Not including unique tiebreakers**
+When sorting by non-unique columns (like timestamps), always include a unique column (ID) as the final sort key. Without this, you'll see duplicate records or gaps when data changes between requests.
+
+**Mistake 3: Exposing raw database values in cursors**
+Never use raw database IDs or timestamps in cursors. Encode them properly and consider encrypting sensitive information. Raw values can leak implementation details and create security vulnerabilities.
+
+**Mistake 4: Ignoring concurrent modifications**
+Users refreshing pages or navigating back/forward can see inconsistent data with offset pagination. Cursor and keyset approaches handle this much better by anchoring to specific record positions.
+
+## Performance Considerations
+
+The performance differences between these patterns become stark at scale:
+
+**Offset pagination** has O(n + m) complexity where n is your offset and m is your limit. For page 1000 with limit 20, that's 20,020 rows processed but only 20 returned. Memory usage grows linearly with page depth.
+
+**Cursor pagination** achieves O(log n + m) complexity by using indexed lookups. The database jumps directly to the cursor position, making page 1000 just as fast as page 1.
+
+**Keyset pagination** offers similar O(log n + m) performance but with the added benefit of leveraging composite indexes efficiently. However, it requires careful schema design.
+
+Network-wise, cursor and keyset approaches typically return less metadata (no total counts), reducing response payload sizes by 20-50% in many cases.
+
+Database connection time also improves significantly with cursor/keyset approaches since queries execute faster and release connections sooner.
+
+## Real-World Usage
+
+Major platforms have standardized on different approaches based on their use cases:
+
+**GitHub** uses cursor-based pagination extensively in their GraphQL API, returning opaque cursors that encode repository-specific information. Their REST API supports both offset and cursor-based approaches.
+
+**Twitter** employs a hybrid approach with cursor-based pagination for timelines but uses offset-based pagination for admin tools where dataset sizes are manageable.
+
+**Shopify** implements keyset pagination for their product APIs, leveraging composite indexes on (vendor, title, id) for efficient catalog browsing.
+
+**Facebook** uses cursor-based pagination for news feeds, with sophisticated cursor encoding that includes user-specific relevance scores alongside chronological ordering.
+
+In my experience at scale, the most successful implementations combine cursor-based pagination for user-facing APIs with offset pagination reserved for administrative interfaces where data volumes are predictable and bounded.
+
+## Frequently Asked Questions
+
+**Q: Should I always use cursor pagination instead of offset?**
+Not necessarily. Offset pagination is perfectly acceptable for small datasets (< 10K records) or when you need to show page numbers. Cursor pagination shines when dealing with large, constantly changing datasets where performance matters.
+
+**Q: How do I handle bidirectional navigation with cursor pagination?**
+Standard cursor pagination is forward-only. For bidirectional support, you need to implement separate cursors for forward and backward navigation, which adds complexity. Many APIs simply don't support backward navigation and require clients to cache previous pages.
+
+**Q: Can I calculate total counts efficiently with cursor pagination?**
+Not reliably. COUNT queries become expensive on large datasets. Consider either disabling total counts entirely, using approximate counts, or maintaining separate counter tables that update asynchronously.
+
+**Q: What happens if records are inserted/deleted between paginated requests?**
+Offset pagination will show duplicates or miss records. Cursor and keyset pagination anchor to specific records, so new inserts appear on subsequent pages while deleted records simply disappear from the results.
+
+**Q: How do I secure cursor values from tampering?**
+Sign your cursors with HMAC using a server-side secret key. This ensures clients can't forge valid cursors for data they shouldn't access. Consider encrypting sensitive fields within the cursor payload.
+
+## Conclusion
+
+Pagination patterns aren't just academic exercises – they're critical infrastructure decisions that directly impact your system's scalability and user experience. 
+
+For new projects, I recommend starting with cursor-based pagination unless you have specific requirements for page numbers or total counts. It offers the best balance of performance, consistency, and simplicity.
+
+Existing systems using offset pagination should prioritize migrating high-traffic endpoints, especially those serving large datasets. You don't need to rewrite everything at once – identify your bottlenecks and tackle them incrementally.
+
+Remember that the "best" pagination strategy depends entirely on your data volume, access patterns, and performance requirements. The key is understanding the trade-offs and making informed decisions based on real metrics, not assumptions.
+
+The web keeps getting faster, users keep expecting instant responses, and data keeps growing. Mastering these pagination patterns isn't just good practice – it's essential for building systems that can grow with your success.

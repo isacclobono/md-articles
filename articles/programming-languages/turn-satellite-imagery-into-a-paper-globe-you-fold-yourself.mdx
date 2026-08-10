@@ -1,0 +1,324 @@
+---
+title: "Turn satellite imagery into a paper globe you fold yourself"
+slug: "turn-satellite-imagery-into-a-paper-globe-you-fold-yourself"
+description: "I’ve spent a lot of time staring at satellite tiles on a monitor, wondering what it would feel like to hold the same data in my hands. A paper globe is a surpri..."
+category: "Programming Languages"
+tags: ["turn", "satellite", "programming languages", "imagery"]
+keywords: ["turn", "tech guide", "programming languages", "imagery", "software engineering", "programming", "satellite"]
+author: "Compiler & Language Architect"
+publishedAt: "2026-08-10"
+readingTime: "10 min read"
+---
+
+# Turn satellite imagery into a paper globe you fold yourself  
+
+## Introduction  
+
+I’ve spent a lot of time staring at satellite tiles on a monitor, wondering what it would feel like to hold the same data in my hands. A paper globe is a surprisingly good way to answer that question: it forces you to confront projection distortion, tile seams, and the sheer volume of pixels that make up a planetary view. The project I’m about to describe started as a weekend hack—download a few Sentinel‑2 scenes, turn them into a mesh, unwrap the mesh into a printable net, and fold the result into a 12‑inch globe. It turned into a reusable pipeline that I now ship as a small open‑source library.  
+
+## Why This Matters  
+
+Engineers who work with geospatial data constantly fight the map‑projection battle. Web mercator is great for slippy maps, but it butchers area near the poles. Equal‑area projections preserve statistics but look weird on a screen. A physical globe sidesteps the projection problem entirely—you get a true‑to‑scale representation that you can rotate, inspect, and hand to a non‑technical stakeholder.  
+
+Beyond the “wow” factor, the pipeline exercises a stack that shows up in production systems every day:  
+
+* **Raster I/O at scale** – reading multi‑gigabyte GeoTIFFs, cloud‑masking, and re‑projecting on the fly.  
+* **Computational geometry** – Delaunay triangulation, spherical parameterisation, and developable‑surface unwrapping.  
+* **Batch orchestration** – parallel tile download, GPU‑accelerated mesh simplification, and PDF generation for print.  
+
+If you can ship a globe, you can ship any tiled, projected, or vectorised geospatial product.  
+
+## How It Works  
+
+The end‑to‑end flow is a classic data‑engineering DAG: acquire → preprocess → mesh → unwrap → tile → export. The diagram below captures the major stages and the hand‑off points where you can inject custom logic (e.g., a different projection or a custom fold‑line style).  
+
+```mermaid
+flowchart TD
+    A[Define AOI & resolution] --> B[Download raw tiles (WMS/STAC)]
+    B --> C[Cloud mask & radiometric correction]
+    C --> D[Mosaic & re‑project to target CRS]
+    D --> E[Raster → height field (optional DEM)]
+    E --> F[Triangular mesh generation (Delaunay)]
+    F --> G[Spherical normalisation]
+    G --> H[Cut sphere along meridians → developable net]
+    H --> I[Layout printable tiles (SVG/PNG + fold lines)]
+    I --> J[Assemble PDF for printing]
+    J --> K[Optional: Web preview (Three.js)]
+    style A fill:#f9f,stroke:#333
+    style K fill:#bbf,stroke:#333
+```
+
+**Step‑by‑step**  
+
+1. **AOI & resolution** – You decide the geographic extent (usually the whole world) and the ground‑sample distance you can afford to print.  
+2. **Download** – Pull tiles from a public WMS/WMTS or a STAC catalogue. The code below uses a simple HTTP GET; in production you’d add exponential back‑off and a token bucket for rate limits.  
+3. **Pre‑process** – Cloud masking (QA band), radiometric scaling, and a warp to a common CRS (EPSG:4326 works well for the spherical step).  
+4. **Mosaic** – Stitch the warped tiles into a single virtual raster (VRT) so the next stage sees one contiguous grid.  
+5. **Height field** – If you have a DEM, bake elevation into the Z coordinate; otherwise treat the raster values as a visual texture only.  
+6. **Mesh** – Run a 2‑D Delaunay on the pixel centres, then lift the vertices onto a unit sphere.  
+7. **Unwrap** – Cut the sphere along a set of meridians (e.g., every 30°) and flatten each zone with an equirectangular or sinusoidal projection that preserves aspect ratio for the printable tiles.  
+8. **Tile layout** – Emit SVG/PNG for each zone, embed fold‑line vectors as a separate layer, and write a PDF that respects bleed and crop marks.  
+9. **Preview** – A tiny Three.js scene loads the same net geometry so you can spin the globe in the browser before committing paper.  
+
+## Core Concepts  
+
+| Concept | Why it matters | Typical implementation |
+|---------|----------------|------------------------|
+| **Map projection** | Determines how spherical coordinates become planar. For a paper globe we need a *developable* projection (zero Gaussian curvature) so the paper doesn’t stretch. | Equirectangular for simple nets; sinusoidal or polyconic for lower distortion. |
+| **Delaunay triangulation** | Gives a well‑behaved mesh from scattered points (pixel centres). Guarantees no skinny triangles, which helps later simplification. | `scipy.spatial.Delaunay` or `triangle` for massive datasets. |
+| **Spherical parameterisation** | Maps 3‑D vertices onto a unit sphere while preserving adjacency. | Normalise each vertex: `v / ||v||`. |
+| **Developable net** | A set of planar polygons that can be folded into the target polyhedron (here an icosphere or a set of gores). | Cut along meridians, then apply a cylindrical or conic flattening per gore. |
+| **Fold‑line geometry** | Vector lines that survive raster‑to‑vector conversion and survive PDF rasterisation. | Store as separate SVG `<path stroke="red" stroke-dasharray="4,2"/>` layer. |
+| **Print‑ready PDF** | Must embed fonts, honour CMYK colour space, and include bleed. | `cairosvg` → `pdf` or `reportlab` with explicit `MediaBox`/`BleedBox`. |
+
+## Examples & Code Walkthrough  
+
+Below is a **single‑file, runnable prototype** that implements the core pipeline. It deliberately avoids heavy frameworks so you can see the moving parts. In a production repo you’d split this into modules, add typing, and wire in a task queue (Celery, Prefect, or Airflow).  
+
+```python
+# build_globe.py
+# ------------------------------------------------------------
+# Minimal end‑to‑end prototype: satellite tiles → printable globe net
+# ------------------------------------------------------------
+from __future__ import annotations
+
+import json
+import math
+import os
+import tempfile
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+import rasterio
+import rasterio.warp
+import requests
+from pyproj import Transformer
+from scipy.spatial import Delaunay
+import trimesh
+import cairosvg
+from svgwrite import Drawing
+from svgwrite.path import Path as SVGPath
+
+# ------------------------------------------------------------------
+# 1️⃣  Configuration
+# ------------------------------------------------------------------
+TILE_SIZE = 512                     # pixels per tile (source service)
+TARGET_DPI = 300                    # print resolution
+GLOBE_DIAMETER_MM = 300             # final globe size
+GORE_COUNT = 12                     # number of longitudinal slices
+OUTPUT_DIR = Path("globe_output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ------------------------------------------------------------------
+# 2️⃣  Helper: download a single tile from a public WMTS endpoint
+# ------------------------------------------------------------------
+def fetch_tile(
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+    dst: Path,
+) -> None:
+    """
+    Pull a GeoTIFF tile from the NASA Worldview WMTS (simplified).
+    Real code would use a STAC search + signed URLs.
+    """
+    url = "https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/MODIS_Terra_CorrectedReflectance_TrueColor/default/2023-07-01/GoogleMapsCompatible_Level6"
+    # The WMTS GetTile request uses tile matrix set, row/col – here we fake it.
+    params = {
+        "SERVICE": "WMTS",
+        "REQUEST": "GetTile",
+        "VERSION": "1.0.0",
+        "LAYER": "MODIS_Terra_CorrectedReflectance_TrueColor",
+        "STYLE": "default",
+        "TILEMATRIXSET": "GoogleMapsCompatible",
+        "TILEMATRIX": "6",
+        "TILEROW": "0",
+        "TILECOL": "0",
+        "FORMAT": "image/tiff",
+    }
+    # In practice you’d compute row/col from bbox. This stub just writes a placeholder.
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_bytes(resp.content)
+
+
+# ------------------------------------------------------------------
+# 3️⃣  Mosaic & warp to a single VRT (virtual raster)
+# ------------------------------------------------------------------
+def build_vrt(tile_paths: List[Path], vrt_path: Path) -> None:
+    """
+    GDAL's BuildVRT is the fastest way to create a mosaic without copying pixels.
+    """
+    import subprocess
+
+    cmd = ["gdalbuildvrt", "-resolution", "highest", str(vrt_path)] + [str(p) for p in tile_paths]
+    subprocess.run(cmd, check=True)
+
+
+# ------------------------------------------------------------------
+# 4️⃣  Raster → triangular mesh (Delaunay on pixel centres)
+# ------------------------------------------------------------------
+def raster_to_mesh(vrt_path: Path, max_vertices: int = 200_000) -> trimesh.Trimesh:
+    """
+    Reads the VRT, optionally down‑samples, runs Delaunay on the
+    (lon, lat) centres, and lifts vertices onto a unit sphere.
+    """
+    with rasterio.open(vrt_path) as src:
+        # Down‑sample if the raster is huge
+        factor = max(1, int(math.sqrt(src.width * src.height / max_vertices)))
+        data = src.read(
+            1,
+            out_shape=(src.height // factor, src.width // factor),
+            resampling=rasterio.enums.Resampling.bilinear,
+        )
+        transform = src.transform * src.transform.scale(factor, factor)
+
+        # Pixel centres in CRS units (degrees for EPSG:4326)
+        rows, cols = np.meshgrid(
+            np.arange(data.shape[0]), np.arange(data.shape[1]), indexing="ij"
+        )
+        xs = (cols + 0.5) * transform.a + transform.c
+        ys = (rows + 0.5) * transform.e + transform.f
+
+        # Mask out nodata / cloud‑masked pixels (assume 0 is nodata for demo)
+        valid = data != 0
+        lon = xs[valid]
+        lat = ys[valid]
+
+    # Delaunay on (lon, lat) – note: this is planar, not spherical.
+    # For a production globe you’d triangulate on the sphere directly
+    # (e.g., using `spherical_delaunay` from `pygplates`).
+    points_2d = np.column_stack([lon, lat])
+    tri = Delaunay(points_2d)
+
+    # Lift to unit sphere
+    # Convert lon/lat → 3‑D Cartesian on unit sphere
+    lon_rad = np.deg2rad(lon[tri.simplices].ravel())
+    lat_rad = np.deg2rad(lat[tri.simplices].ravel())
+    x = np.cos(lat_rad) * np.cos(lon_rad)
+    y = np.cos(lat_rad) * np.sin(lon_rad)
+    z = np.sin(lat_rad)
+    verts = np.column_stack([x, y, z]).reshape(-1, 3)
+
+    # Unique vertices (Delaunay returns duplicates per triangle)
+    uniq_verts, inverse = np.unique(verts, axis=0, return_inverse=True)
+    faces = inverse.reshape(-1, 3)
+
+    mesh = trimesh.Trimesh(vertices=uniq_verts, faces=faces, process=False)
+    return mesh
+
+
+# ------------------------------------------------------------------
+# 5️⃣  Unwrap sphere → developable gores (simple equirectangular per gore)
+# ------------------------------------------------------------------
+def unwrap_to_gores(mesh: trimesh.Trimesh, gore_count: int) -> List[np.ndarray]:
+    """
+    Cuts the sphere along meridians every 360/gore_count degrees.
+    Returns a list of (N, 2) arrays – planar (x, y) coordinates for each gore.
+    """
+    verts = mesh.vertices  # already unit‑sphere
+    # Spherical coordinates
+    lon = np.arctan2(verts[:, 1], verts[:, 0])          # -π … π
+    lat = np.arcsin(verts[:, 2])                        # -π/2 … π/2
+
+    gore_width = 2 * math.pi / gore_count
+    gores = []
+    for i in range(gore_count):
+        centre = -math.pi + (i + 0.5) * gore_width
+        half = gore_width / 2
+        mask = (lon >= centre - half) & (lon < centre + half)
+        # Equirectangular flattening for this gore
+        x = (lon[mask] - centre) * math.cos(lat[mask])   # preserve local scale
+        y = lat[mask]
+        gores.append(np.column_stack([x, y]))
+    return gores
+
+
+# ------------------------------------------------------------------
+# 6️⃣  Render each gore as an SVG tile with fold lines
+# ------------------------------------------------------------------
+def gore_to_svg(gore_pts: np.ndarray, idx: int, dpi: int) -> Path:
+    """
+    Creates an SVG drawing for a single gore.
+    The gore is scaled to the target globe diameter.
+    """
+    # Globe circumference in mm → pixel size at target DPI
+    circumference_mm = math.pi * GLOBE_DIAMETER_MM
+    px_per_mm = dpi / 25.4
+    scale = circumference_mm * px_per_mm / (2 * math.pi)  # map rad → px
+
+    # Determine bounding box of the gore in radians
+    min_x, min_y = gore_pts.min(axis=0)
+    max_x, max_y = gore_pts.max(axis=0)
+    width_px = (max_x - min_x) * scale
+    height_px = (max_y - min_y) * scale
+
+    dwg = Drawing(size=(f"{width_px}px", f"{height_px}px"), profile="tiny")
+    # Background rectangle (white paper)
+    dwg.add(dwg.rect(insert=(0, 0), size=(width_px, height_px), fill="white"))
+
+    # Fold lines – two long edges + optional latitude lines every 15°
+    fold_color = "red"
+    dash = "4,2"
+    # Long edges
+    dwg.add(
+        dwg.path(
+            d=f"M 0 0 L 0 {height_px}",
+            stroke=fold_color,
+            stroke_width=0.5,
+            stroke_dasharray=dash,
+            fill="none",
+        )
+    )
+    dwg.add(
+        dwg.path(
+            d=f"M {width_px} 0 L {width_px} {height_px}",
+            stroke=fold_color,
+            stroke_width=0.5,
+            stroke_dasharray=dash,
+            fill="none",
+        )
+    )
+    # Latitude lines (every 15°)
+    for lat_deg in range(-75, 90, 15):
+        lat_rad = math.radians(lat_deg)
+        # Map latitude to y in the gore (equirectangular)
+        y = (lat_rad - min_y) * scale
+        dwg.add(
+            dwg.path(
+                d=f"M 0 {y} L {width_px} {y}",
+                stroke=fold_color,
+                stroke_width=0.3,
+                stroke_dasharray="2,2",
+                fill="none",
+            )
+        )
+
+    # TODO: rasterise the actual imagery onto the gore (omitted for brevity)
+    # You would warp the source VRT into the gore's planar CRS and write a PNG,
+    # then embed it with <image href="gore_0.png" .../>.
+
+    svg_path = OUTPUT_DIR / f"gore_{idx:02d}.svg"
+    dwg.saveas(svg_path)
+    return svg_path
+
+
+# ------------------------------------------------------------------
+# 7️⃣  Assemble PDF (one page per gore, with bleed)
+# ------------------------------------------------------------------
+def assemble_pdf(gore_svgs: List[Path], pdf_path: Path) -> None:
+    """
+    Uses cairosvg to convert each SVG to a PDF page, then merges with PyPDF2.
+    """
+    from PyPDF2 import PdfMerger
+
+    merger = PdfMerger()
+    for svg in gore_svgs:
+        pdf_bytes = cairosvg.svg2pdf(url=str(svg), dpi=TARGET_DPI)
+        tmp_pdf = svg.with_suffix(".pdf")
+        tmp_pdf.write_bytes(pdf_bytes)
+        merger.append(str(tmp_pdf))
+    merger.write(str(pdf_path

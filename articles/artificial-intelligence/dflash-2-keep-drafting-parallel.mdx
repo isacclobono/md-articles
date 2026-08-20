@@ -1,0 +1,160 @@
+---
+title: "DFlash 2: Keep Drafting Parallel"
+slug: "dflash-2-keep-drafting-parallel"
+description: "The last five years have seen AI-assisted writing move from experimental demos into daily driver tools for engineers, marketers, and product teams. Most platfor..."
+category: "Artificial Intelligence"
+tags: ["artificial intelligence", "keep", "drafting", "dflash"]
+keywords: ["drafting", "dflash", "artificial intelligence", "keep", "software engineering", "tech guide", "programming"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-08-20"
+readingTime: "7 min read"
+---
+
+# DFlash 2: Keep Drafting Parallel
+
+## Introduction
+The last five years have seen AI-assisted writing move from experimental demos into daily driver tools for engineers, marketers, and product teams. Most platforms still impose a linear workflow: generate, review, edit, repeat. That serial bottleneck shows up as latency when multiple collaborators want to iterate simultaneously, and it creates merge conflicts when version control tries to reconcile divergent AI outputs.
+
+DFlash 2 emerged from a need to treat AI drafting like source code collaboration: concurrent, traceable, and mergeable. Rather than forcing a single model to own the entire output, DFlash 2 splits the workflow into discrete, event-driven steps that can happen in parallel across users, models, and feedback loops. The result is a system where a draft can be improved, split, reordered, and remerged without losing context or triggering "last-write-wins" overwrites.
+
+## Why This Matters
+Engineers building or integrating AI generation features often hit three recurring friction points. First, latency: round-tripping a prompt through a remote LLM, waiting for tokens, and then manually applying changes kills iteration speed. Second, collaboration: when two team members prompt the same model with slightly different constraints, merging their outputs becomes a manual copy-paste exercise. Third, auditability: tracking why a particular sentence appeared, which model version generated it, and who approved it requires ad-hoc logging.
+
+DFlash 2 addresses these by treating every edit, model call, and user rating as an event in a central stream. That event model enables real-time synchronization, deterministic merge behavior, and a clear provenance trail. For teams that ship AI-powered products at scale, that structure translates directly to faster delivery cycles and fewer "who changed this?" meetings.
+
+## How It Works
+Under this section, you'll find the system architecture visualizing how events flow through the pipeline.
+
+```mermaid
+flowchart TD
+    A[User Types/Drafts] --> B[Event Sourcing Producer]
+    B --> C[Event Stream (Kafka)]
+    C --> D[CRDT Synchronizer]
+    D --> E[Unified Draft State]
+    E --> F[Human-AI Feedback Loop]
+    F --> G[Model Registry]
+    G --> H[LLM Inference]
+    H --> I[Improved Draft Segment]
+    I --> J[Event Stream]
+    E --> J
+    style A fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
+    style B fill:#bbdefb,stroke:#1a237e,stroke-width:2px
+    style C fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    style D fill:#e3f2fd,stroke:#0d47a1,stroke-width:2px
+    style E fill:#f1f8e9,stroke:#2e7d32,stroke-width:2px
+    style F fill:#fffde7,stroke:#f57f17,stroke-width:2px
+    style G fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    style H fill:#ede7f6,stroke:#6a1b9a,stroke-width:2px
+    style I fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
+    style J fill:#fff3e0,stroke:#e65100,stroke-width:2px
+```
+
+**Flow summary:** A user begins typing or pasting a prompt. The Event Sourcing Producer captures every keystroke or AI-generated segment as a timestamped event pushed to a Kafka-backed stream. The CRDT Synchronizer sits downstream, merging concurrent edits from multiple users or model instances using operational transforms. The resulting Unified Draft State is immediately available to the Human-AI Feedback Loop, which can prompt a user for a thumbs-up/thumbs-down or automatically route the segment to the Model Registry. The Registry selects an appropriate LLM endpoint based on latency, cost, and task type. After inference, the improved draft segment re-enters the event stream, where it gets merged back into the Unified Draft State. The loop continues until the team signals finalization.
+
+## Core Concepts
+- **Event Sourcing Engine**: Every change—whether a user typing a sentence, a model completing a thought, or a human rating a draft—is recorded as an immutable event. This enables replay, audit, and recovery without relying on a single source-of-truth database.
+- **CRDT Synchronizer**: Conflict-Free Replicated Data Types allow multiple peers to operate on the same logical draft without a central lock. When two users insert text at the same position, the OT (operational transform) layer transforms one edit against the other, producing equivalent results regardless of apply order.
+- **Human-AI Feedback Loop**: Rather than treating user input as a one-shot prompt, this loop captures explicit feedback (thumbs, comments, rate limits) and feeds it back into the system. The loop can trigger model re-selection, prompt refinement, or draft truncation.
+- **Model Registry**: A versioned catalog of LLM endpoints. Each entry records the model name, token pricing, average latency, and capability tags (e.g., "creative writing," "code generation"). The registry feeds the feedback loop with routing decisions, ensuring that expensive models aren't called for trivial edits and that low-latency models handle real-time interaction.
+
+## Examples & Code Walkthrough
+### Event Sourcing Producer
+The following Python snippet demonstrates a minimal event producer that emits draft-edits to a Kafka topic. The design assumes a running Kafka cluster and uses the `confluent_kafka` client for reliability.
+
+```python
+import json
+import uuid
+from datetime import datetime, timezone
+from confluent_kafka import Producer
+
+KAFKA_BOOTSTRAP = "kafka:9092"
+TOPIC = "draft_events"
+
+def make_producer():
+    conf = {"bootstrap.servers": KAFKA_BOOTSTRAP}
+    return Producer(conf)
+
+def emit_draft_event(producer: Producer, user_id: str, edit_type: str, content: str, draft_id: str):
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "user_id": user_id,
+        "edit_type": edit_type,  # e.g., "insert", "delete", "replace"
+        "content": content,
+        "draft_id": draft_id,
+    }
+    producer.produce(
+        TOPIC,
+        key=draft_id,
+        value=json.dumps(event).encode("utf-8"),
+        on_delivery=lambda err, msg: None,
+    )
+    producer.poll(0)
+
+# Usage example (in a real system, the producer would be long-lived)
+# p = make_producer()
+# emit_draft_event(p, user_id="alice", edit_type="insert", content="However, the matrix...", draft_id="draft-42")
+# p.flush()
+```
+
+### CRDT Merge (Operational Transform)
+Below is a self-contained OT function that merges two concurrent inserts into a shared draft text. The function assumes edits are represented as `(position, text, length_delta)` tuples. In production, this would be backed by a library like `automerge` or `yjs`, but writing the core transform explicitly makes the collision resolution strategy explicit.
+
+```python
+def transform_edit(edit, other_edit):
+    """Return a transformed edit that accounts for other_edit's effect."""
+    pos, text, delta = edit
+    other_pos, other_text, other_delta = other_edit
+    # If other_edit inserts before this edit, shift position
+    if other_pos < pos:
+        pos += len(other_text)
+    # If other_edit deletes before this edit, adjust position and delta
+    if other_pos <= pos + delta:
+        delta -= other_delta
+    return (pos, text, delta)
+
+def merge_edits(base_text, edit_a, edit_b):
+    """Apply two concurrent edits to base_text, returning a consistent result."""
+    a_transformed = transform_edit(edit_a, edit_b)
+    b_transformed = transform_edit(edit_b, edit_a)
+    a_pos, a_text, a_delta = a_transformed
+    b_pos, b_text, b_delta = b_transformed
+    # Apply A first, then B on the result
+    after_a = base_text[:a_pos] + a_text + base_text[a_pos + a_delta:]
+    after_b = after_a[:b_pos] + b_text + after_a[b_pos + b_delta:]
+    return after_b
+```
+
+### Adaptive Feedback Loop
+The async feedback function below shows how user sentiment can steer subsequent model calls. The implementation uses `httpx` for async HTTP calls to an LLM gateway, but the pattern works with any async-capable client.
+
+```python
+import asyncio
+import httpx
+
+LLM_GATEWAY_URL = "https://llm-gateway.internal/v1/complete"
+
+async def analyze_sentiment(feedback: str) -> str:
+    """Very small heuristic: positive if contains 'good', 'great', 'thanks'. """
+    lowered = feedback.lower()
+    if any(word in lowered for word in ("good", "great", "thanks", "love")):
+        return "positive"
+    return "neutral"
+
+async def llm_refinement(draft: str, instruction: str) -> str:
+    async with httpx.AsyncClient() as client:
+        payload = {
+            "model": "claude-3-opus",
+            "prompt": f"Refine the following draft based on this instruction: {instruction}. Keep the original voice.\n\n{draft}",
+            "max_tokens": 512,
+            "temperature": 0.3,
+        }
+        resp = await client.post(LLM_GATEWAY_URL, json=payload, timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["text"].strip()
+
+async def feedback_loop(user_feedback: str, draft: str) -> str:
+    sentiment = await analyze_sentiment(user_feedback)
+    if sentiment == "positive":
+        improved = await llm_refinement(draft, "expand on strengths")

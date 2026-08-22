@@ -1,0 +1,254 @@
+---
+title: "AWS EC2 Deployment — Q&A Reference"
+slug: "aws-ec2-deployment-qa-reference"
+description: "If you have spent any time running production workloads on AWS, you know that EC2 is simultaneously the most fundamental and the most dangerous primitive in the..."
+category: "Web Development"
+tags: ["reference", "web development", "deployment"]
+keywords: ["reference", "tech guide", "web development", "programming", "software engineering", "deployment"]
+author: "Lead Frontend & Web Architect"
+publishedAt: "2026-08-22"
+readingTime: "9 min read"
+---
+
+# AWS EC2 Deployment — Q&A Reference
+
+## Introduction
+
+If you have spent any time running production workloads on AWS, you know that EC2 is simultaneously the most fundamental and the most dangerous primitive in the catalog. It is the "sharp knife" of cloud compute: incredibly powerful when handled with respect, capable of severe injury when treated casually.
+
+Most guides treat EC2 as a virtual machine you log into. That mindset is the problem. In a modern architecture, an EC2 instance is not a pet; it is a disposable, immutable artifact produced by a pipeline. The difference between a deployment that survives a zone outage and one that pages you at 3 AM usually comes down to three decisions made *before* you ever hit `RunInstances`: how you inject identity, how you bootstrap configuration, and how you define "healthy."
+
+This reference isn't a click-path tutorial. It is a curated set of answers to the architectural questions that actually determine reliability, security posture, and operational burden. We are assuming you are building for automation (Terraform, CloudFormation, CDK), targeting immutable infrastructure patterns, and treating SSH access as a break-glass exception, not a daily workflow.
+
+## Why This Matters
+
+The industry has largely moved to containers and serverless, yet EC2 remains the substrate for a massive portion of the world's compute. Kubernetes control planes, legacy monoliths undergoing strangler-fig migrations, GPU workloads for ML inference, and specialized network appliances all run on bare metal or VMs.
+
+The pain points haven't changed in a decade, but the tooling has:
+*   **Configuration Drift:** Manual changes via SSH create snowflakes that cannot be reproduced.
+*   **Credential Leakage:** Hardcoding secrets in User Data or baking them into AMIs is still the number one cause of credential rotation incidents.
+*   **Boot Stragglers:** Instances passing health checks while the application is still warming caches or downloading artifacts, causing traffic blackholes.
+*   **Metadata Service Exposure:** IMDSv1 is a SSRF vulnerability waiting to happen; enforcing IMDSv2 is non-negotiable.
+
+If you treat EC2 as "just a Linux box," you inherit the operational tax of 2005. If you treat it as a platform capability—leveraging Systems Manager, Instance Metadata Service v2, and Nitro enclaves—you get a secure, auditable, and scalable compute layer that integrates natively with the rest of AWS.
+
+## How It Works
+
+The deployment lifecycle of a production-grade EC2 instance is a chain of trust and verification. It starts in your CI/CD pipeline, passes through the AWS control plane, lands on the hypervisor, executes a bootstrapping sequence, and finally registers itself as a healthy target.
+
+The diagram below illustrates the critical path and the security boundaries involved. Note the explicit separation between the *Control Plane* (API/IaC) and the *Data Plane* (Instance Runtime), and the role of the SSM Agent as the primary management interface replacing SSH.
+
+```mermaid
+flowchart TD
+    subgraph CICD [CI/CD Pipeline]
+        direction TB
+        Code[Source Commit] --> Build[Build Artifact / AMI]
+        Build --> Validate[Policy Check: IMDSv2, EBS Encrypt, IAM Least Priv]
+        Validate --> Deploy[Terraform Plan/Apply]
+    end
+
+    subgraph ControlPlane [AWS Control Plane]
+        Deploy --> API[AWS API: RunInstances / ASG Update]
+        API --> IAM[IAM Instance Profile Validation]
+        API --> SG[Security Group Evaluation]
+        API --> Net[Subnet / ENI Allocation]
+    end
+
+    subgraph InstanceBoot [Instance Boot Sequence (Nitro Hypervisor)]
+        Net --> Init[Kernel Init / systemd]
+        Init --> IMDS[IMDSv2 Token Negotiation]
+        IMDS --> SSM[SSM Agent Start]
+        SSM --> UserData[Execute User Data / cloud-init]
+    end
+
+    subgraph Bootstrap [Application Bootstrap]
+        UserData --> Secrets[Fetch Secrets: SSM Parameter Store / Secrets Manager]
+        Secrets --> Config[Render Config Files]
+        Config --> Migrate[Run DB Migrations / Schema Sync]
+        Migrate --> Health[Local Health Probe Loop]
+    end
+
+    subgraph Runtime [Steady State Operations]
+        Health -->|Pass| Register[Register Target: ALB / Cloud Map / Consul]
+        Health -->|Fail| Terminate[Signal Failure: ASG Replace / Exit Code]
+        Register --> Metrics[Push Custom Metrics: Memory, Queue Depth, JVM Heap]
+        Metrics --> SSMOps[Run Command / Session Manager for Debug]
+    end
+
+    subgraph SecurityBoundaries [Cross-Cutting Security]
+        IAM -.->|Least Priv Role| IMDS
+        SG -.->|Ingress/Egress Rules| Net
+        KMS[KMS Key] -.->|Encrypt EBS / Secrets| InstanceBoot
+    end
+
+    style CICD fill:#e3f2fd,stroke:#1565c0
+    style ControlPlane fill:#fff3e0,stroke:#ef6c00
+    style InstanceBoot fill:#fce4ec,stroke:#c2185b
+    style Bootstrap fill:#e8f5e9,stroke:#2e7d32
+    style Runtime fill:#f3e5f5,stroke:#7b1fa2
+    style SecurityBoundaries fill:#eceff1,stroke:#455a64,stroke-dasharray: 5 5
+```
+
+### Step-by-Step Breakdown
+
+1.  **Policy Gate (CI/CD):** Before the API call leaves your pipeline, policy-as-code (OPA/Rego or Checkov) validates the Terraform plan. It enforces `metadata_options { http_tokens = "required" }`, `ebs_block_device { encrypted = true }`, and verifies the IAM role attached has no `*` resources.
+2.  **Control Plane Admission:** The `RunInstances` call (or ASG Launch Template version update) hits the EC2 API. IAM validates the Instance Profile. VPC validates the Security Group rules and Subnet capacity (IP exhaustion is a real outage cause).
+3.  **Nitro Boot & IMDSv2:** The hypervisor presents the Instance Metadata Service. The instance *must* negotiate a session token (PUT request) before reading metadata. This mitigates SSRF. If your AMI has a hardcoded `curl http://169.254.169.254/latest/meta-data/` without the token header, it fails here.
+4.  **SSM Agent Primacy:** The Amazon SSM Agent starts early (baked into Amazon Linux 2023 / Ubuntu Pro AMIs). It establishes a persistent WebSocket connection to the SSM service endpoint (via VPC Interface Endpoint for private subnets). This is your *only* management plane.
+5.  **Idempotent Bootstrap:** User Data runs once. It must be idempotent because ASG replacements re-run it. It pulls configuration from Parameter Store (SecureString), renders templates (using `envsubst` or `confd`), runs one-time migrations, and enters a health probe loop.
+6.  **Graceful Registration:** The instance does *not* register with the Load Balancer until the local health endpoint returns `200 OK` on `/ready` (not just `/live`). This prevents the "boot straggler" problem.
+7.  **Observability Loop:** A lightweight sidecar (or the CloudWatch Agent with custom config) pushes memory, disk, and application-specific metrics (e.g., `p99 latency`, `goroutine count`) to CloudWatch. Alarms drive ASG scaling policies.
+
+## Core Concepts
+
+### 1. Immutable Infrastructure via Launch Templates
+Never modify a running instance. Never create an AMI by hand (`CreateImage` from a running instance carries state, logs, and SSH keys). Build AMIs in a pipeline (Packer, Image Builder, or `docker export` -> `vmimport`). Deploy by creating a new Launch Template version and triggering an Instance Refresh on the Auto Scaling Group.
+
+### 2. Identity over Credentials
+The Instance Profile (IAM Role for EC2) is the *only* valid authentication mechanism.
+*   **Anti-pattern:** `aws_access_key_id` in `~/.aws/credentials` or environment variables injected via User Data.
+*   **Pattern:** The application uses the AWS SDK default credential chain. It picks up the role credentials automatically from IMDSv2 (`/latest/meta-data/iam/security-credentials/<role-name>`). The SDK handles rotation transparently.
+
+### 3. User Data vs. cloud-init vs. SSM Documents
+*   **User Data:** Runs once at first boot. Limited to 16KB. Good for "bootstrap the bootstrapper" (install SSM agent if missing, set hostname, mount EBS).
+*   **cloud-init:** The standard Linux boot configurator. Handles per-boot and per-instance scripts, disk setup, network config. Use `cloud-config` YAML in User Data for complex logic.
+*   **SSM Documents (Run Command / State Manager):** For *post-launch* configuration drift remediation or patching. This is how you "SSH" without SSH.
+
+### 4. The 169.254.169.254 Contract
+The Instance Metadata Service (IMDS) is a local HTTP endpoint.
+*   **IMDSv1:** `GET /latest/meta-data/...` — Vulnerable to SSRF.
+*   **IMDSv2:** `PUT /latest/api/token` (TTL header) -> `GET /latest/meta-data/...` (Token header).
+*   **Enforcement:** `aws ec2 modify-instance-metadata-options --instance-id i-xxx --http-tokens required`. Do this at the Launch Template level (`metadata_options { http_tokens = "required", http_put_response_hop_limit = 2 }`).
+
+## Examples & Code Walkthrough
+
+### 1. Terraform: The "Secure by Default" Launch Template
+This module snippet encodes the non-negotiable security baseline. It prevents the most common misconfigurations at plan time.
+
+```hcl
+# modules/secure_ec2/main.tf
+resource "aws_launch_template" "app" {
+  name_prefix   = "${var.service_name}-"
+  update_default_version = true
+
+  # 1. Enforce IMDSv2 + Hop Limit 2 (prevents container escape to metadata)
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+    instance_metadata_tags      = "enabled" # Allows tags to be read via IMDS
+  }
+
+  # 2. Root volume encryption + GP3 for price/performance
+  block_device_mappings {
+    device_name = "/dev/xvda" # Amazon Linux 2023 default
+    ebs {
+      volume_type           = "gp3"
+      volume_size           = var.root_volume_size
+      encrypted             = true
+      kms_key_id            = var.kms_key_arn # Customer Managed Key, not aws/ebs
+      delete_on_termination = true
+      throughput            = 250 # MiB/s
+      iops                  = 3000
+    }
+  }
+
+  # 3. Network Interface: No Public IP, Security Groups via Ref
+  network_interfaces {
+    associate_public_ip_address = false
+    security_groups             = var.security_group_ids
+    subnet_id                   = var.subnet_id
+    device_index                = 0
+    groups                      = var.security_group_ids
+  }
+
+  # 4. IAM Instance Profile (Passed as ARN, not name, to avoid cycles)
+  iam_instance_profile {
+    arn = var.instance_profile_arn
+  }
+
+  # 5. User Data: Rendered via templatefile, base64 encoded automatically by provider
+  user_data = base64encode(templatefile("${path.module}/user_data.tpl", {
+    service_name     = var.service_name
+    environment      = var.environment
+    ssm_param_path   = var.ssm_param_path
+    datadog_api_key_arn = var.datadog_api_key_arn # Secret ARN, not value
+  }))
+
+  # 6. Tagging Strategy: Propagate to ASG/Instances/Volumes
+  tag_specifications {
+    resource_type = "instance"
+    tags = merge(var.common_tags, {
+      "Name" = "${var.service_name}-${var.environment}"
+    })
+  }
+  tag_specifications {
+    resource_type = "volume"
+    tags = var.common_tags
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+**Key Decisions:**
+*   `http_put_response_hop_limit = 2`: Allows containers (Docker bridge + 1 hop) to reach IMDS, but prevents a compromised container from pivoting further.
+*   `kms_key_id = var.kms_key_arn`: Using a Customer Managed Key (CMK) allows key rotation policies and cross-account access control. The default `aws/ebs` key is opaque.
+*   `user_data` uses `templatefile`: Keeps logic out of HCL, allows complex bash/heredoc rendering.
+
+---
+
+### 2. User Data Template: Idempotent Bootstrap with SSM Parameter Store
+This script (`user_data.tpl`) runs as root via cloud-init. It is designed to be re-runnable (ASG instance refresh) and fails fast if secrets are missing.
+
+```bash
+#!/bin/bash
+# user_data.tpl - Rendered by Terraform templatefile()
+# Shebang is mandatory for cloud-init script module.
+
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# --- Configuration Injected by Terraform ---
+SERVICE_NAME="${service_name}"
+ENVIRONMENT="${environment}"
+SSM_PARAM_PATH="${ssm_param_path}"
+DD_API_KEY_ARN="${datadog_api_key_arn}"
+LOG_FILE="/var/log/bootstrap.log"
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Bootstrap started for $SERVICE_NAME/$ENVIRONMENT"
+
+# --- Helper: Fetch SecureString from Parameter Store ---
+# Uses IMDSv2 token implicitly via AWS CLI v2 default credential chain.
+fetch_secret() {
+  local name="$1"
+  local value
+  value=$(aws ssm get-parameter --name "$name" --with-decryption --query "Parameter.Value" --output text --region "${AWS_REGION}" 2>/dev/null) || {
+    echo "FATAL: Failed to fetch $name from SSM" >&2
+    return 1
+  }
+  echo "$value"
+}
+
+# --- 1. System Prep (Idempotent) ---
+echo "Configuring system limits..."
+cat <<'EOF' > /etc/security/limits.d/99-app.conf
+* soft nofile 65535
+* hard nofile 65535
+* soft nproc 32768
+* hard nproc 32768
+EOF
+
+# Ensure SSM Agent is running (Critical for Session Manager)
+systemctl enable --now amazon-ssm-agent
+
+# --- 2. Secrets Retrieval (Fail Fast) ---
+echo "Fetching application secrets..."
+DB_PASSWORD=$(fetch_secret "${SSM_PARAM_PATH}/db_password") || exit 1
+JWT_SECRET=$(fetch_secret "${SSM_PARAM_PATH}/jwt_secret") || exit 1
+DD_API_KEY=$(fetch_secret "$DD_API_KEY_ARN") || exit 1 # ARN passed, CLI resolves
+
+# --- 3. Configuration Rendering ---
+APP_CONFIG_DIR="/etc/${S

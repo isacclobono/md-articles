@@ -1,0 +1,320 @@
+---
+title: "Redis Is Not Your Database: Designing Cache Failures, Fallbacks, and Resilient Backends"
+slug: "redis-is-not-your-database-designing-cache-failures-fallbacks-and-resilient-backends"
+description: "A few months ago, one of our payment services reported a cascade failure that took down a significant portion of our transaction processing. The root cause? An ..."
+category: "System Design"
+tags: ["database", "system design", "redis", "your"]
+keywords: ["programming", "redis", "software engineering", "your", "system design", "database", "tech guide"]
+author: "Principal Systems Architect"
+publishedAt: "2026-09-13"
+readingTime: "10 min read"
+---
+
+# Redis Is Not Your Database: Designing Cache Failures, Fallbacks, and Resilient Backends
+
+## Introduction
+A few months ago, one of our payment services reported a cascade failure that took down a significant portion of our transaction processing. The root cause? An assumption that Redis could safely serve as a durable data store. When a node crashed, the cache layer went silent, and our fallback logic was never triggered because the service continued to write to Redis as if it were a primary database. The outage lasted 12 minutes, cost us millions in revenue, and forced an emergency rollback. That incident reshaped how we think about caching. Redis is a high‑throughput, in‑memory dictionary with optional persistence. It is not a transaction log, nor a relational store with strong consistency guarantees. Treating it as a database introduces hidden single points of failure, data loss windows, and operational complexity that quickly compound in a distributed system.
+
+## Why This Matters
+Engineering teams constantly chase latency. The instinct is to push hot data into Redis and avoid the disk I/O of a primary database. This works well until the cache layer becomes a bottleneck, a consistency problem, or a failure point. In production, Redis nodes crash, network partitions happen, and memory pressure forces evictions. When the cache is mistaken for the source of truth, those events translate directly into data loss, stale reads, and service degradation. The cost is not just performance; it is reliability. The industry has seen enough incidents to know that resilience must be designed into the *interaction* between the cache and the backend, not assumed from the cache’s existence.
+
+## How It Works
+The architecture below illustrates a request flowing through multiple cache tiers, a circuit breaker, and a fallback layer. The diagram is a visual summary of the patterns discussed throughout this article.
+
+```mermaid
+flowchart TD
+    A[Client Request] --> B[API Gateway]
+    B --> C[Application Service]
+    C --> D{L1 Cache Hit?}
+    D -->|Yes| E[Return L1 Response]
+    D -->|No| F{L2 Cache Hit?}
+    F -->|Yes| G[Populate L1 & Return]
+    F -->|No| H[Circuit Breaker State]
+    H -->|Closed| I[Fetch from DB]
+    H -->|Open| J[Fallback to Stale/ DB]
+    I --> K[Write to L2 (Redis)]
+    I --> L[Write to L1]
+    I --> E
+    J --> E
+    K --> C
+    L --> C
+```
+
+The flow starts with a client request reaching the API gateway. The gateway forwards the request to the application service. The service first checks an in‑process cache (L1). A hit returns immediately. A miss pushes the request to Redis (L2). If Redis returns data, it is cached locally and the response is sent. If Redis is unavailable or the circuit is open, the system falls back to a stale snapshot or a rate‑limited read from the primary database. Meanwhile, a background refresh populates L1 and L2 without blocking the client.
+
+### Step‑by‑step breakdown
+1. **L1 In‑Process Cache** – A thread‑local map or `lru_cache` decorator holds the most recent values. It is the fastest layer and eliminates any remote call.
+2. **L2 Distributed Cache (Redis)** – Provides horizontal scaling and shared state across service instances.
+3. **Circuit Breaker** – Monitors failure rates and latency. When thresholds are exceeded, it trips to `OPEN`. The service bypasses Redis and uses the fallback path.
+4. **Fallback Layer** – A composition of three strategies:
+   * **Stale‑while‑revalidate** – Serve the last known good value while asynchronously refreshing.
+   * **Direct‑DB with Throttling** – If the fallback is stale, read from the primary DB under a token bucket limiter to avoid thundering herds.
+   * **Graceful Degradation** – Return partial responses (e.g., default values) when data is unavailable.
+5. **Async Refresh** – A background job or semaphore‑guarded task ensures L1 and L2 are repopulated once the circuit closes or after a successful DB read.
+
+## Core Concepts
+* **Cache‑Aside Pattern** – The application reads from the cache; on a miss, it loads from the database and writes back to the cache. This pattern is simple but requires careful handling of write operations to keep the cache consistent.
+* **Read‑Through vs. Write‑Through** – Read‑through delegates the cache population to a shared cache client. Write‑through pushes updates immediately into Redis. Both patterns trade consistency for latency.
+* **Circuit Breaker States** – `CLOSED` (normal operation), `HALF_OPEN` (allow a single test request), `OPEN` (fail fast to fallback). The state transitions are driven by error percentage and latency percentiles over a sliding window.
+* **Stale‑While‑Revalidate (SWR)** – A cache entry carries an `expires_at` timestamp. After expiry, the service may serve the stale value while a background task fetches fresh data. The SWR TTL is typically longer than the refresh interval.
+* **Fallback Tiers** – 
+  1. **L1** – In‑process, lock‑free structures.
+  2. **L2** – Redis cluster with TTLs and eviction policies.
+  3. **L3** – Primary relational store (or document DB) with strong consistency.
+* **Graceful Degradation** – When all layers fail, the service returns a sensible default (e.g., cached snapshot of the last 24 hours) or queues the request for later processing.
+
+## Examples & Code Walkthrough
+Below is a production‑grade implementation of the circuit breaker and fallback layer in Python. The code is intentionally detailed to illustrate defensive patterns, concurrency control, and observability hooks.
+
+```python
+import time
+import threading
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Any, Optional, Callable
+from collections import deque
+import asyncio
+import random
+
+# ----------------------------------------------------------------------
+# 1. Circuit Breaker
+# ----------------------------------------------------------------------
+class CircuitState(Enum):
+    CLOSED = auto()
+    HALF_OPEN = auto()
+    OPEN = auto()
+
+@dataclass
+class CircuitBreaker:
+    failure_threshold: int = 5
+    recovery_timeout: float = 60.0  # seconds
+    expected_exception: type[Exception] = Exception
+
+    _state: CircuitState = CircuitState.CLOSED
+    _failure_count: int = 0
+    _last_failure_time: float = 0.0
+    _lock: threading.RLock = field(default_factory=threading.RLock)
+
+    def __post_init__(self):
+        self._monitor_thread = threading.Thread(target=self._monitor, daemon=True)
+        self._monitor_thread.start()
+
+    def _monitor(self):
+        while True:
+            with self._lock:
+                if self._state == CircuitState.OPEN and time.time() - self._last_failure_time > self.recovery_timeout:
+                    self._state = CircuitState.HALF_OPEN
+            time.sleep(1)
+
+    def record_success(self):
+        with self._lock:
+            if self._state == CircuitState.HALF_OPEN:
+                self._state = CircuitState.CLOSED
+                self._failure_count = 0
+            elif self._state == CircuitState.CLOSED:
+                self._failure_count = 0
+
+    def record_failure(self):
+        with self._lock:
+            self._failure_count += 1
+            self._last_failure_time = time.time()
+            if self._failure_count >= self.failure_threshold and self._state != CircuitState.OPEN:
+                self._state = CircuitState.OPEN
+
+    def allow_request(self) -> bool:
+        with self._lock:
+            if self._state == CircuitState.CLOSED:
+                return True
+            if self._state == CircuitState.HALF_OPEN:
+                return True
+            return False
+
+    def get_state(self) -> CircuitState:
+        with self._lock:
+            return self._state
+
+# ----------------------------------------------------------------------
+# 2. Fallback Strategies
+# ----------------------------------------------------------------------
+class FallbackStrategy(Enum):
+    STALE_WHILE_REVALIDATE = auto()
+    DIRECT_DB_THROTTLED = auto()
+    GRACEFUL_DEGRADATION = auto()
+
+@dataclass
+class CacheEntry:
+    key: str
+    value: Any
+    expires_at: float
+    version: int = 0
+    stale_since: float = field(default_factory=time.time)
+
+class FallbackLayer:
+    def __init__(
+        self,
+        l1_cache: dict,
+        l2_client: Any,  # Redis client
+        db_reader: Callable[[str], Any],
+        circuit_breaker: CircuitBreaker,
+        stale_ttl: float = 300.0,
+        refresh_interval: float = 60.0,
+        token_bucket: Optional[dict] = None,
+    ):
+        self.l1 = l1_cache
+        self.l2 = l2_client
+        self.db_reader = db_reader
+        self.cb = circuit_breaker
+        self.stale_ttl = stale_ttl
+        self.refresh_interval = refresh_interval
+        self.token_bucket = token_bucket or {"tokens": 10, **self._refill_tokens(token_bucket)}
+        self._refresh_lock = threading.Lock()
+        self._pending_refreshes: set[str] = set()
+
+    def _refill_tokens(self, bucket):
+        # Simple token bucket implementation for throttling DB reads
+        def refill():
+            while True:
+                time.sleep(1)
+                with self._lock:
+                    if bucket["tokens"] < 10:
+                        bucket["tokens"] = min(10, bucket["tokens"] + 1)
+        t = threading.Thread(target=refill, daemon=True)
+        t.start()
+        return bucket
+
+    def get(self, key: str) -> Any:
+        # 1. Check L1
+        if key in self.l1:
+            entry: CacheEntry = self.l1[key]
+            if time.time() < entry.expires_at:
+                return entry.value
+            # L1 expired, fall through to L2
+
+        # 2. Check L2
+        try:
+            raw = self.l2.get(key)
+            if raw is not None:
+                entry = CacheEntry(**raw)  # assume Redis returns a serialized dict
+                # Repopulate L1
+                self.l1[key] = entry
+                return entry.value
+        except Exception:
+            # L2 failure, continue to fallback
+            pass
+
+        # 3. Circuit is open or L2 miss -> Fallback
+        if not self.cb.allow_request():
+            return self._fallback(key, FallbackStrategy.GRACEFUL_DEGRADATION)
+
+        # 4. Closed or half‑open: fetch from DB
+        try:
+            # Simple token bucket throttling
+            if self.token_bucket["tokens"] <= 0:
+                return self._fallback(key, FallbackStrategy.GRACEFUL_DEGRADATION)
+
+            with self._refresh_lock:
+                if key in self._pending_refreshes:
+                    # Another thread is already refreshing, wait a bit
+                    time.sleep(0.1)
+                    return self._fallback(key, FallbackStrategy.STALE_WHILE_REVALIDATE)
+
+                self._pending_refreshes.add(key)
+
+            # Perform DB read
+            fresh_value = self.db_reader(key)
+            new_version = 0  # In real code, increment based on DB's version column
+            expires_at = time.time() + self.stale_ttl
+
+            # Write back to L2 (fire‑and‑forget, ignore write errors)
+            try:
+                self.l2.set(key, CacheEntry(key=key, value=fresh_value, expires_at=expires_at, version=new_version)..__dict__)
+            finally:
+                self._pending_refreshes.remove(key)
+
+            # Populate L1
+            self.l1[key] = CacheEntry(key=key, value=fresh_value, expires_at=expires_at, version=new_version)
+
+            self.cb.record_success()
+            return fresh_value
+
+        except Exception as e:
+            self.cb.record_failure()
+            return self._fallback(key, FallbackStrategy.STALE_WHILE_REVALIDATE)
+
+    def _fallback(self, key: str, strategy: FallbackStrategy) -> Any:
+        if strategy == FallbackStrategy.STALE_WHILE_REVALIDATE:
+            # Serve the oldest version we have, if any
+            for entry in reversed(self.l1.values()):
+                if entry.key == key:
+                    return entry.value
+            # No L1, try L2 directly (bypassing circuit)
+            try:
+                raw = self.l2.get(key)
+                if raw:
+                    entry = CacheEntry(**raw)
+                    return entry.value
+            except Exception:
+                pass
+        elif strategy == FallbackStrategy.DIRECT_DB_THROTTLED:
+            if self.token_bucket["tokens"] > 0:
+                self.token_bucket["tokens"] -= 1
+                return self.db_reader(key)
+        elif strategy == FallbackStrategy.GRACEFUL_DEGRADATION:
+            # Return a sensible default; in production this could be a cached snapshot
+            return {"error": "service_unavailable", "key": key}
+        # Ultimate fallback
+        return None
+
+# ----------------------------------------------------------------------
+# 3. Example Usage
+# ----------------------------------------------------------------------
+def db_reader_simulation(key: str):
+    # Simulate a slow DB call
+    time.sleep(random.uniform(0.05, 0.2))
+    return {"data": f"value_for_{key}", "ts": time.time()}
+
+def main():
+    l1 = {}
+    # Mock Redis client
+    class MockRedis:
+        def __init__(self):
+            self.store = {}
+        def get(self, k):
+            return self.store.get(k)
+        def set(self, k, v):
+            self.store[k] = v
+    l2 = MockRedis()
+    cb = CircuitBreaker(failure_threshold=3, recovery_timeout=30.0)
+    fallback = FallbackLayer(l1, l2, db_reader_simulation, cb)
+
+    # First request – cold cache
+    print("Request 1:", fallback.get("user:123"))
+    # Second request – warm L1
+    print("Request 2:", fallback.get("user:123"))
+    # Simulate Redis failure
+    l2.get = lambda k: (_ for _ in ()).throw(Exception("Redis down"))
+    print("Request 3 (Redis down):", fallback.get("user:456"))
+
+if __name__ == "__main__":
+    main()
+```
+
+**Key design decisions**
+* **Thread‑safe structures** – `threading.RLock` guards circuit state and token bucket updates to avoid race conditions under concurrent load.
+* **Token bucket throttling** – Limits direct DB reads during cache degradation, preventing thundering herd problems.
+* **Pending refresh set** – Guarantees that only one coroutine refreshes a given key, eliminating cache stampedes.
+* **Circuit health monitoring** – A background thread automatically transitions from `OPEN` to `HALF_OPEN` after the recovery timeout, allowing the system to test if the underlying service is back online.
+
+## Best Practices
+* **Never assume Redis durability** – Use persistence (`AOF`/`RDB`) with appropriate sync policies, but treat the data as ephemeral for business logic.
+* **Design cache expiry around business needs** – A TTL of 5 minutes may be fine for session data but dangerous for pricing information.
+* **Instrument cache interactions** – Track hit/miss ratios, eviction counts, and circuit state changes. Alert when miss ratios climb above a threshold.
+* **Keep fallback logic simple** – Complex conditional logic in fallback paths often introduces new bugs. Prefer composition of small, testable strategies.
+* **Circuit breaker thresholds** – Base thresholds on historical latency and error distributions. A static number of 5 failures is rarely appropriate across services.
+
+## Common Mistakes & Anti-Patterns
+1. **Writing business‑critical data directly into Redis** – Redis lacks transactional guarantees across multiple keys. Use a primary database for writes and only cache reads.
+2. **Ignoring cache stampedes** – On a cache miss, allowing N simultaneous DB queries spikes load. Use a mutex or distributed lock (e.g., Redis `SETNX`) to serialize refreshes.
+3. **Over‑relying on stale‑while‑revalidate** – Serving stale data without versioning can expose users to inconsistent state. Include a `version` or `ETag` field and validate on subsequent requests.
+4. **Neglecting circuit breaker half‑open safety** – Allowing unrestricted traffic during `HALF_OPEN` can re‑trigger failures. Limit to a single test request with a short timeout.
+5. **Hard‑coded fallback responses**

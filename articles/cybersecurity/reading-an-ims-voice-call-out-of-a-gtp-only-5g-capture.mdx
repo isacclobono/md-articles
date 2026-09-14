@@ -1,6 +1,7 @@
 ---
 title: "Reading an IMS voice call out of a GTP-only 5G capture"
 slug: "reading-an-ims-voice-call-out-of-a-gtp-only-5g-capture"
+<<<<<<< HEAD
 description: "In a 5G deployment, the N6 interface between the UPF and the IMS core carries user‑plane traffic encapsulated in GTP‑U. When a capture is taken only at the GTP ..."
 category: "Cybersecurity"
 tags: ["reading", "voice", "call", "cybersecurity"]
@@ -323,3 +324,323 @@ A: Yes. The N6 interface is the same for both standalone and non‑standalone 5G
 
 ## Conclusion
 Extracting IMS signaling and media from a GTP‑U capture is a matter of respecting the layering of the protocol stack and applying a deterministic, stateful decoder. By parsing the GTP header, extracting the inner IP packet, dispatching to the correct transport parser, and then walking through SIP state transitions and SDP extraction, you can reconstruct a complete call record—including who called whom, when, for how long, and what codec was used. The approach is lightweight, scalable, and can be integrated into existing capture‑analysis pipelines, giving engineers and auditors a clear view of voice traffic that would otherwise remain opaque.
+=======
+description: "A few months ago, our security operations team flagged an anomaly in a 5G core network capture. The packet dump contained nothing but GTP-U packets flowing betw..."
+category: "Cybersecurity"
+tags: ["cybersecurity", "call", "voice", "reading"]
+keywords: ["cybersecurity", "tech guide", "programming", "software engineering", "voice", "reading", "call"]
+author: "Principal Cybersecurity Specialist"
+publishedAt: "2026-09-14"
+readingTime: "9 min read"
+---
+
+# Reading an IMS Voice Call out of a GTP-only 5G Capture
+
+## Introduction
+
+A few months ago, our security operations team flagged an anomaly in a 5G core network capture. The packet dump contained nothing but GTP-U packets flowing between the UPF and the gNodeB. No SIP messages were visible. No RTP streams jumped out. Yet downstream forensic analysis confirmed that an IMS voice call had taken place inside that tunnel.
+
+This is the reality of modern 5G packet inspection. When you're handed a GTP-only capture, the IMS signaling and media are buried inside GTP tunnels, invisible to any tool that doesn't know how to strip those layers away. Reading an IMS voice call out of that kind of capture requires understanding the 5G packet structure, the GTP encapsulation hierarchy, and the IMS payload hiding inside.
+
+This article walks you through exactly how to do that — from the architecture down to working code.
+
+## Why This Matters
+
+5G networks moved the control plane and user plane further apart than any previous generation. The Session Management Function (SMF) sets up PDU sessions. The User Plane Function (UPF) tunnels user traffic using GTP-U. The gNodeB wraps everything in another GTP-U tunnel toward the core.
+
+For cybersecurity teams, this creates a visibility gap. A network intrusion detection system sitting on the wire sees GTP packets — not the actual SIP INVITE, not the RTP audio payload, not the IMS authentication tokens riding inside. If you're doing forensic analysis after a breach, or trying to detect toll fraud on IMS voice services, you need to get inside those tunnels.
+
+We've seen production incidents where IMS voice fraud went undetected for weeks because the monitoring stack only inspected the outer GTP headers. The inner SIP messages carrying call setup and teardown were completely opaque.
+
+The practical problem: given a pcap that contains only GTP-U traffic between the UPF and the radio access network, how do you reconstruct the IMS voice call — call identity, participants, duration, and media characteristics?
+
+## How It Works
+
+The 5G user plane uses a layered encapsulation model. At the outermost level, you have the GTP-U header. Inside that sits the original IP packet — which in the case of IMS voice, is either a SIP message or an RTP/RTCP stream. Those inner packets are themselves carrying the actual IMS signaling or media.
+
+Here's the flow:
+
+```mermaid
+sequenceDiagram
+    participant UE as User Equipment (UE)
+    participant gNB as gNodeB
+    participant UPF as User Plane Function
+    participant DM as Data Network (IMS Core)
+
+    UE->>gNB: IMS Voice (SIP/RTP)
+    Note over UE,gNB: GTP-U Tunnel 1
+    gNB->>UPF: GTP-U Packet (Outer Header)
+    Note over gNB,UPF: GTP-U Tunnel 2
+    UPF->>DM: GTP-U Packet (Outer Header)
+    Note over UPF,DM: GTP-U Tunnel 3
+
+    subgraph Capture Point
+        direction TB
+        Note over Capture: GTP-only pcap
+        GTP_U_Outer["GTP-U Header<br/>(TEID, Sequence No.)"]
+        InnerIP["Inner IP Packet<br/>(SIP or RTP)"]
+        IMSPayload["IMS Payload<br/>(Voice Call Data)"]
+    end
+
+    GTP_U_Outer-->>InnerIP: Contains
+    InnerIP-->>IMSPayload: Contains
+
+    style GTP_U_Outer fill:#f9f,stroke:#333,stroke-width:2px
+    style InnerIP fill:#bbf,stroke:#333,stroke-width:2px
+    style IMSPayload fill:#bfb,stroke:#333,stroke-width:2px
+```
+
+The extraction process works in three stages:
+
+**Stage 1: Parse the GTP-U header.** Each GTP-U packet starts with an 8-byte (or 12-byte with sequence extension) header. The critical field is the TEID (Tunnel Endpoint Identifier), which tells you which PDU session this packet belongs to. You also extract the sequence number and the N-PDU number if present.
+
+**Stage 2: Strip the GTP-U header and extract the inner IP packet.** Once you've consumed the GTP-U header, the next bytes are the original IP packet. You need to identify the protocol — IPv4, IPv6, or PPP. For IMS traffic, this is typically IPv4 or IPv6 carrying UDP payloads.
+
+**Stage 3: Parse the inner payload.** The inner UDP packet is either SIP (port 5060/5061) or RTP (dynamic ports, typically 10000-20000). If it's SIP, you reconstruct the call metadata. If it's RTP, you extract the audio payload, SSRC identifiers, timestamps, and payload type to characterize the voice call.
+
+The challenge is that in a GTP-only capture, you often don't have the SIP signaling visible at the capture point — it may have been terminated at the SMF or AMF before the traffic entered the GTP tunnel. What you see is only the RTP media flowing through the tunnel. Reconstructing the full call requires correlating RTP streams across multiple GTP-U packets and mapping TEIDs back to PDU sessions.
+
+## Core Concepts
+
+Before you can write extraction code, you need to internalize several key data structures and protocol fields.
+
+**GTP-U Header Structure.** The GTP-U header is defined in 3GPP TS 29.281. The base header is 8 bytes:
+
+- Version (3 bits), Protocol Type (1 bit), Reserved (1 bit)
+- Message Type (8 bits) — 0xFF for GTP-U
+- Message Length (16 bits)
+- TEID (32 bits) — Tunnel Endpoint Identifier
+- Sequence Number (16 bits) — optional, present if the N-PDU number flag is set
+- N-PDU Number (8 bits) — optional
+- Next Extending Header (8 bits)
+
+When the sequence extension flag is set, an additional 4-byte extension header follows, containing the sequence number and N-PDU number.
+
+**TEID Mapping.** The TEID is the key to correlating packets. Each UPF-to-gNB tunnel has a unique TEID. You need a mapping table that associates TEIDs with PDU sessions, which in turn map to IMS subscribers and call contexts.
+
+**Inner Payload Identification.** Once you've stripped GTP-U, the inner packet's protocol field (in the IP header) tells you what's inside. For IMS voice:
+- Protocol 17 (UDP) is the most common
+- Destination port 5060/5061 indicates SIP
+- Dynamic UDP ports (typically 10000-20000) indicate RTP
+- RTP payload type in the RTP header (bytes 1-2 of the RTP header, with marker bit and payload type) tells you the codec (PCMA, PCMU, Opus, etc.)
+
+**PDU Session Context.** In 5G, a PDU session is established by the SMF and mapped to a GTP-U tunnel by the UPF. The SSC (Session and Service Continuity) mode determines how the anchor UPF behaves during mobility events, which affects TEID stability and packet flow continuity.
+
+## Examples & Code Walkthrough
+
+Let's build a complete extraction pipeline. We'll use Python with Scapy for packet parsing, and we'll handle the full GTP-U stripping and IMS payload extraction.
+
+First, the GTP-U header parser:
+
+```python
+from scapy.all import *
+from scapy.layers.inet import IP, UDP
+import struct
+import json
+from collections import defaultdict
+
+class GTPUParser:
+    """
+    Parses GTP-U headers from 5G user-plane captures.
+    Handles both the base 8-byte header and the 12-byte header
+    with sequence extension.
+    """
+
+    # GTP-U message type
+    GTP_U_MESSAGE_TYPE = 0xFF
+
+    def __init__(self):
+        # TEID -> list of extracted inner packets
+        self.teid_map = defaultdict(list)
+        # TEID -> PDU session metadata
+        self.teid_to_session = {}
+
+    def parse_gtp_header(self, raw_bytes: bytes) -> dict:
+        """
+        Parse the GTP-U header from raw bytes.
+        Returns a dict with header fields and the offset
+        to the start of the inner payload.
+        """
+        if len(raw_bytes) < 8:
+            raise ValueError("Packet too short to contain a GTP-U header")
+
+        # Byte 0: flags and version
+        byte0 = raw_bytes[0]
+        version = (byte0 >> 5) & 0x07
+        protocol_type = (byte0 >> 4) & 0x01
+        reserved = (byte0 >> 3) & 0x01
+        extension_flag = (byte0 >> 2) & 0x01
+        seq_number_flag = (byte0 >> 1) & 0x01
+        npdu_number_flag = byte0 & 0x01
+
+        if version != 1:
+            raise ValueError(f"Unsupported GTP version: {version}")
+        if protocol_type != 1:
+            raise ValueError("Not a GTP packet (protocol type mismatch)")
+
+        # Byte 1: message type
+        message_type = raw_bytes[1]
+        if message_type != self.GTP_U_MESSAGE_TYPE:
+            raise ValueError(f"Not a GTP-U message: type=0x{message_type:02X}")
+
+        # Bytes 2-3: message length
+        msg_length = struct.unpack('!H', raw_bytes[2:4])[0]
+
+        # Bytes 4-7: TEID
+        teid = struct.unpack('!I', raw_bytes[4:8])[0]
+
+        header_size = 8
+        extra_bytes = 0
+
+        # Check for sequence extension
+        if seq_number_flag or npdu_number_flag:
+            if len(raw_bytes) < 12:
+                raise ValueError("Sequence flag set but packet too short for extension header")
+            header_size = 12
+            extra_bytes = 4
+
+        if extension_flag:
+            # Additional extension headers may follow
+            # For our purposes, we skip them — real implementations
+            # would parse each extension header type
+            pass
+
+        inner_payload_offset = header_size
+
+        return {
+            'version': version,
+            'message_type': message_type,
+            'message_length': msg_length,
+            'teid': teid,
+            'sequence_number_flag': bool(seq_number_flag),
+            'npdu_number_flag': bool(npdu_number_flag),
+            'header_size': header_size,
+            'inner_payload_offset': inner_payload_offset
+        }
+
+    def extract_inner_packet(self, raw_bytes: bytes) -> dict:
+        """
+        Full extraction: parse GTP-U, strip header, return
+        the inner IP packet bytes and TEID context.
+        """
+        gtp_info = self.parse_gtp_header(raw_bytes)
+        inner_start = gtp_info['inner_payload_offset']
+        inner_packet = raw_bytes[inner_start:]
+
+        return {
+            'teid': gtp_info['teid'],
+            'inner_packet_bytes': inner_packet,
+            'header_info': gtp_info
+        }
+```
+
+Now, the IMS payload extractor that operates on the inner packets:
+
+```python
+class IMSExtractor:
+    """
+    Extracts IMS voice call metadata and media characteristics
+    from inner IP packets (SIP and RTP) found inside GTP-U tunnels.
+    """
+
+    def __init__(self):
+        self.calls = {}  # call_id -> call metadata
+        self.rtp_streams = defaultdict(list)  # ssrc -> list of RTP packets
+
+    def parse_inner_ip(self, ip_bytes: bytes) -> object:
+        """
+        Parse the inner IP packet using Scapy.
+        Returns the Scapy packet object or None on failure.
+        """
+        try:
+            pkt = IP(ip_bytes)
+            return pkt
+        except Exception as e:
+            # Not a valid IP packet — could be PPP or other encapsulation
+            return None
+
+    def extract_sip_call(self, udp_packet: object) -> dict:
+        """
+        Extract IMS call metadata from a SIP message.
+        Parses INVITE, 200 OK, BYE to build a call record.
+        """
+        if not udp_packet.haslayer(Raw):
+            return None
+
+        payload = udp_packet[Raw].load.decode('utf-8', errors='replace')
+        if not payload.startswith(('INVITE', 'ACK', 'BYE', '200', 'REGISTER')):
+            return None
+
+        # Parse SIP headers
+        lines = payload.split('\r\n')
+        sip_headers = {}
+        call_id = None
+        from_header = None
+        to_header = None
+        cseq = None
+
+        for line in lines:
+            if ':' in line:
+                key, _, value = line.partition(':')
+                sip_headers[key.strip()] = value.strip()
+
+                if key.strip().lower() == 'call-id':
+                    call_id = value.strip()
+                elif key.strip().lower() == 'from':
+                    from_header = value.strip()
+                elif key.strip().lower() == 'to':
+                    to_header = value.strip()
+                elif key.strip().lower() == 'cseq':
+                    cseq = value.strip()
+
+        if not call_id:
+            return None
+
+        method = lines[0].split(' ')[0] if lines else 'UNKNOWN'
+
+        call_record = {
+            'call_id': call_id,
+            'method': method,
+            'from': from_header,
+            'to': to_header,
+            'cseq': cseq,
+            'sip_headers': sip_headers,
+            'timestamp': None
+        }
+
+        # Store or update the call record
+        if call_id not in self.calls:
+            self.calls[call_id] = call_record
+        else:
+            self.calls[call_id].update(call_record)
+
+        return call_record
+
+    def extract_rtp_stream(self, udp_packet: object, teid: int) -> dict:
+        """
+        Extract RTP stream characteristics from a UDP packet
+        carrying RTP inside a GTP-U tunnel.
+        """
+        if not udp_packet.haslayer(Raw):
+            return None
+
+        rtp_bytes = udp_packet[Raw].load
+        if len(rtp_bytes) < 12:
+            return None
+
+        # RTP header: first 12 bytes
+        byte0 = rtp_bytes[0]
+        version = (byte0 >> 6) & 0x03
+        padding = (byte0 >> 5) & 0x01
+        extension = (byte0 >> 4) & 0x01
+        csrc_count = byte0 & 0x0F
+
+        if version != 2:
+            return None  # Not RTP version 2
+
+        marker = (rtp_bytes[1] >> 7) & 0x01
+        payload_type = rtp_bytes[1] & 0x7F
+        sequence_number = struct.unpack('!H', rtp_bytes[2:4])[0]
+        timestamp = struct.unpack('!I', rtp_bytes[4:8])[0]
+        ssrc = struct.unpack('!I', rtp_bytes
+>>>>>>> 775547a (Generated article: Reading an IMS voice call out of a GTP-only 5G capture)

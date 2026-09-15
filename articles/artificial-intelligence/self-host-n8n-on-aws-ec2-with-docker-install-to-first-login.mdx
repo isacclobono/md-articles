@@ -1,0 +1,393 @@
+---
+title: "Self-Host n8n on AWS EC2 with Docker - Install to First Login"
+slug: "self-host-n8n-on-aws-ec2-with-docker-install-to-first-login"
+description: "Self-hosting n8n on AWS EC2 is a practical way to run workflow automation without giving every workflow, credential, and execution log to a third-party SaaS pla..."
+category: "Artificial Intelligence"
+tags: ["with", "self", "host", "artificial intelligence"]
+keywords: ["tech guide", "software engineering", "host", "self", "programming", "with", "artificial intelligence"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-09-15"
+readingTime: "9 min read"
+---
+
+# Self-Host n8n on AWS EC2 with Docker - Install to First Login
+
+## Introduction
+
+Self-hosting n8n on AWS EC2 is a practical way to run workflow automation without giving every workflow, credential, and execution log to a third-party SaaS platform. For engineering teams, the appeal is simple: you control the runtime, the database, the secrets, the network boundary, and the upgrade schedule.
+
+The hard part is not running the container.
+
+The hard part is making the deployment behave like a production service: persistent data, stable webhooks, secure cookies, encryption keys, reverse proxy support, backups, and a repeatable first-login process.
+
+This guide walks through a clean EC2 + Docker Compose setup for n8n using PostgreSQL for persistence. It gets you from a fresh Ubuntu EC2 instance to the n8n owner signup screen, with enough operational detail to avoid the common failure modes I have seen in real deployments.
+
+## Why This Matters
+
+n8n is increasingly used by engineering, data, and AI teams to orchestrate work that sits between APIs, databases, queues, LLM providers, internal tools, and human approval steps.
+
+Typical workloads include:
+
+- AI support-ticket triage using OpenAI, Anthropic, or local models
+- Document ingestion into vector databases
+- Slack or Microsoft Teams approval flows
+- CRM enrichment from inbound webhooks
+- Scheduled database reconciliation jobs
+- Internal tooling glue where a full service would be overkill
+
+The production pain point is that workflow automation often starts as a prototype and then quietly becomes business-critical. A failed webhook, missing encryption key, expired TLS certificate, or lost SQLite file can turn a useful automation platform into an incident.
+
+Self-hosting n8n on EC2 gives you a controlled deployment path:
+
+- Workflows and credentials are stored in your infrastructure.
+- Execution logs stay inside your VPC unless you explicitly export them.
+- You can attach IAM roles, private networking, security groups, and managed databases.
+- You can upgrade n8n on your own schedule.
+- You can run AI workflows that need access to private APIs or internal services.
+
+For a small team, one well-hardened EC2 instance is often enough. For heavier workloads, the same foundation can later evolve into queue mode, multiple workers, Redis, managed PostgreSQL, and a proper load balancer.
+
+## How It Works
+
+At a high level, the deployment has four moving parts:
+
+1. **Docker Engine** runs the containers.
+2. **Docker Compose** defines n8n and PostgreSQL as a repeatable stack.
+3. **PostgreSQL** stores workflows, credentials, users, and execution metadata.
+4. **n8n** serves the web UI, runs workflows, and exposes webhook endpoints.
+
+For a first production-style install, we keep n8n and PostgreSQL on the same EC2 instance but isolate data with Docker volumes. This is not the only valid architecture, but it is a good starting point because it is easy to inspect, back up, and migrate.
+
+```mermaid
+flowchart LR
+    User[Engineer or Operator] -->|HTTPS| LB[Optional AWS ALB or Nginx]
+    LB --> App[n8n Container]
+    App --> DB[(PostgreSQL Container)]
+    App --> Vol[n8n Data Volume]
+    DB --> DBVol[(PostgreSQL Volume])
+    App --> Webhook[Webhook Endpoint]
+    Webhook --> External[External API, AI Provider, CRM, Slack]
+    App --> Secrets[Environment Secrets]
+```
+
+The request path is straightforward:
+
+1. A user opens the n8n web UI.
+2. n8n checks whether an owner account exists.
+3. If no owner exists, n8n shows the first-login setup screen.
+4. After owner creation, users can create workflows and credentials.
+5. When a workflow runs, n8n persists relevant data to PostgreSQL.
+6. Webhook-triggered workflows receive HTTP requests through the configured public URL.
+
+The most important configuration values are:
+
+- `N8N_HOST`: the public hostname used to access n8n.
+- `WEBHOOK_URL`: the public base URL used by webhook triggers.
+- `N8N_ENCRYPTION_KEY`: protects stored credentials.
+- `N8N_SECURE_COOKIE`: should be enabled when using HTTPS.
+- `DB_TYPE`: set to `postgresdb` for PostgreSQL persistence.
+- `POSTGRES_PASSWORD` and database settings: keep PostgreSQL from running as an anonymous local-only database.
+
+A common mistake is treating n8n like a stateless web app. It is not. Workflow definitions, credentials, users, and execution metadata must persist across container restarts.
+
+## Core Concepts
+
+### n8n
+
+n8n is a workflow automation platform. Workflows are composed of nodes. Each node performs a specific action, such as calling an HTTP API, transforming JSON, querying a database, or invoking an AI model.
+
+Internally, n8n needs to persist:
+
+- Workflow definitions
+- Credentials
+- Users and roles
+- Execution records
+- Webhook registrations
+- Settings and metadata
+
+For production, PostgreSQL is a better default than SQLite because it gives you stronger durability, better concurrency characteristics, and a clearer backup strategy.
+
+### Docker Compose
+
+Docker Compose lets us define the n8n service and its database as a single unit. Instead of manually running `docker run` commands, we declare the desired state in a file.
+
+That matters because production debugging becomes easier. You can inspect the exact image version, environment variables, volumes, ports, and restart policy in one place.
+
+### PostgreSQL
+
+PostgreSQL stores n8n’s application data. In this setup, it runs in a container with a named Docker volume.
+
+For a small deployment, this is acceptable if you back up the volume or dump the database regularly. For higher availability, move PostgreSQL to Amazon RDS or Aurora and keep only the n8n application container on EC2.
+
+### Docker Volumes
+
+Docker volumes survive container recreation. That is critical.
+
+If you delete a container without a persistent volume, you can lose application data. Compose named volumes are still local to the EC2 instance, so they are not a replacement for backups.
+
+### Environment Variables
+
+n8n is heavily configured through environment variables. This is useful in Docker because secrets and runtime behavior can be injected without modifying the image.
+
+The important distinction:
+
+- Public routing settings: `N8N_HOST`, `WEBHOOK_URL`
+- Security settings: `N8N_ENCRYPTION_KEY`, `N8N_SECURE_COOKIE`
+- Database settings: `DB_TYPE`, `DB_POSTGRESDB_HOST`, `DB_POSTGRESDB_PORT`, `DB_POSTGRESDB_DATABASE`, `DB_POSTGRESDB_USER`, `DB_POSTGRESDB_PASSWORD`
+- Operational settings: execution retention, timezone, binary data mode
+
+### Reverse Proxy and TLS
+
+n8n does not need to terminate TLS itself in most deployments. A better pattern is:
+
+- n8n listens internally on port `5678`
+- Nginx, Caddy, or AWS ALB handles HTTPS
+- n8n receives forwarded headers
+- `N8N_SECURE_COOKIE=true` is enabled
+
+If you expose port `5678` directly to the internet, you are responsible for TLS and for locking down access at the security group level.
+
+## Examples & Code Walkthrough
+
+The following example assumes:
+
+- AWS EC2 instance running Ubuntu 22.04 or Ubuntu 24.04
+- Public DNS record pointing to the EC2 instance, for example `n8n.example.com`
+- Docker and Docker Compose installed
+- Ports `80` and `443` available for a reverse proxy
+- n8n running internally on port `5678`
+
+If you are using an AWS Application Load Balancer, you can adapt the reverse proxy section accordingly.
+
+### 1. Create the Deployment Directory
+
+```bash
+sudo mkdir -p /opt/n8n-stack
+sudo chown -R "$USER:$USER" /opt/n8n-stack
+cd /opt/n8n-stack
+```
+
+We use `/opt/n8n-stack` because it keeps deployment files separate from user home directories. This also makes it easier for another engineer to find the stack later.
+
+### 2. Install Docker
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+
+sudo install -m 0755 -d /etc/apt/keyrings
+
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+sudo usermod -aG docker "$USER"
+```
+
+Log out and back in so the group membership is applied:
+
+```bash
+newgrp docker
+```
+
+Verify Docker:
+
+```bash
+docker version
+docker compose version
+```
+
+### 3. Create the Environment File
+
+Create `/opt/n8n-stack/.env`:
+
+```bash
+nano /opt/n8n-stack/.env
+```
+
+Paste the following configuration:
+
+```bash
+# Public hostname used to access n8n.
+# Do not include https:// here.
+N8N_HOST=n8n.example.com
+
+# Public webhook base URL.
+# Use https:// when TLS is terminated by Nginx, Caddy, or an AWS ALB.
+WEBHOOK_URL=https://n8n.example.com
+
+# Internal n8n editor path.
+N8N_EDITOR_BASE_URL=https://n8n.example.com
+
+# Secure browser cookies when n8n is served over HTTPS.
+N8N_SECURE_COOKIE=true
+
+# Generate once and keep stable.
+# If this key changes, existing encrypted credentials may become unreadable.
+# Generate with:
+# openssl rand -hex 32
+N8N_ENCRYPTION_KEY=replace-with-a-long-random-value
+
+# Timezone used by workflow schedules.
+GENERIC_TIMEZONE=UTC
+N8N_DEFAULT_TIMEZONE=UTC
+
+# PostgreSQL connection settings used by n8n.
+DB_TYPE=postgresdb
+DB_POSTGRESDB_HOST=postgres
+DB_POSTGRESDB_PORT=5432
+DB_POSTGRESDB_DATABASE=n8n
+DB_POSTGRESDB_USER=n8n
+DB_POSTGRESDB_PASSWORD=replace-with-a-strong-postgres-password
+
+# Keep execution history from growing forever.
+EXECUTIONS_DATA_PRUNE=true
+EXECUTIONS_DATA_MAX_AGE=336
+
+# Store large binary payloads on disk instead of in the database by default.
+N8N_DEFAULT_BINARY_DATA_MODE=filesystem
+
+# Restrict access to the n8n editor unless a user is authenticated.
+N8N_EDITOR_BASE_URL=https://n8n.example.com
+```
+
+Generate the encryption key before starting the stack:
+
+```bash
+openssl rand -hex 32
+```
+
+Generate the PostgreSQL password too:
+
+```bash
+openssl rand -base64 32
+```
+
+Do not reuse passwords between services.
+
+### 4. Create the Docker Compose File
+
+Create `/opt/n8n-stack/docker-compose.yml`:
+
+```bash
+nano /opt/n8n-stack/docker-compose.yml
+```
+
+Paste:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: n8n-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_POSTGRESDB_DATABASE}
+      POSTGRES_USER: ${DB_POSTGRESDB_USER}
+      POSTGRES_PASSWORD: ${DB_POSTGRESDB_PASSWORD}
+      TZ: ${GENERIC_TIMEZONE}
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - n8n_internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_POSTGRESDB_USER} -d ${DB_POSTGRESDB_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      N8N_HOST: ${N8N_HOST}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      N8N_EDITOR_BASE_URL: ${N8N_EDITOR_BASE_URL}
+      N8N_SECURE_COOKIE: ${N8N_SECURE_COOKIE}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
+      N8N_DEFAULT_TIMEZONE: ${N8N_DEFAULT_TIMEZONE}
+      DB_TYPE: ${DB_TYPE}
+      DB_POSTGRESDB_HOST: ${DB_POSTGRESDB_HOST}
+      DB_POSTGRESDB_PORT: ${DB_POSTGRESDB_PORT}
+      DB_POSTGRESDB_DATABASE: ${DB_POSTGRESDB_DATABASE}
+      DB_POSTGRESDB_USER: ${DB_POSTGRESDB_USER}
+      DB_POSTGRESDB_PASSWORD: ${DB_POSTGRESDB_PASSWORD}
+      EXECUTIONS_DATA_PRUNE: ${EXECUTIONS_DATA_PRUNE}
+      EXECUTIONS_DATA_MAX_AGE: ${EXECUTIONS_DATA_MAX_AGE}
+      N8N_DEFAULT_BINARY_DATA_MODE: ${N8N_DEFAULT_BINARY_DATA_MODE}
+    ports:
+      - "127.0.0.1:5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - n8n_internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    container_name: n8n-nginx
+    restart: unless-stopped
+    depends_on:
+      n8n:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx_tls:/etc/nginx/tls:ro
+    networks:
+      - n8n_internal
+
+volumes:
+  postgres_data:
+  n8n_data:
+
+networks:
+  n8n_internal:
+    driver: bridge
+```
+
+A few implementation details are worth calling out.
+
+First, n8n only binds to localhost on the host:
+
+```yaml
+ports:
+  - "127.0.0.1:5678:5678"
+```
+
+That prevents direct public access to the n8n editor. All external traffic should go through the reverse proxy.
+
+Second, PostgreSQL is not exposed to the host at all. It is only reachable inside the Compose network.
+
+Third, the `depends_on` condition prevents n8n from booting before PostgreSQL is ready. This avoids early startup crashes caused by race conditions.
+
+### 5. Create the Nginx Configuration
+
+Create

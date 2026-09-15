@@ -1,0 +1,215 @@
+---
+title: "Bellek Adli Bilişiminde /proc/kcore ile Ham RAM İncelemesi"
+slug: "bellek-adli-bilişiminde-prockcore-ile-ham-ram-incelemesi"
+description: "Bir Linux sistemde çalışan bir sürecin belleği, saldırı tespiti veya veri geri kazanımı için kanıt olarak değerli olabilir. Ancak bellek içinde yer alan hassas ..."
+category: "Operating Systems"
+tags: ["operating systems", "bilişiminde", "bellek", "adli"]
+keywords: ["software engineering", "bilişiminde", "operating systems", "tech guide", "adli", "bellek", "programming"]
+author: "Kernel & Systems Software Engineer"
+publishedAt: "2026-09-15"
+readingTime: "8 min read"
+---
+
+# Bellek Adli Bilişiminde /proc/kcore ile Ham RAM İncelemesi
+
+## Introduction
+Bir Linux sistemde çalışan bir sürecin belleği, saldırı tespiti veya veri geri kazanımı için kanıt olarak değerli olabilir. Ancak bellek içinde yer alan hassas bilgiler (şifreleme anahtarları, oturum jetonları, kötü amaçlı kod parçacıkları) genellikle standart araçlarla tam olarak erişilemez. /proc/kcore special dosyası, çekirdeğin fiziksel belleğini bir ELF görüntüsü olarak sunar ve bu sayede ham RAM’i doğrudan inceleyebiliriz. Bu makalede, /proc/kcore’u nasıl açacağız, ELF yapısını nasıl çözeceğiz ve fiziksel sayfaları tarayarak bir gizli anahtar simülasyonu yapacağız adım adım gösterilecektir.
+
+## Why This Matters
+Üretim ortamlarında bir güvenlik olayı ortaya çıktığında, bellek dökümü almak zaman alıcı olabilir ve sistemin çalışmasını durdurabilir. /proc/kcore, çalışan bir çekirdeğin belleğini sıfır kapalı zamanla okumayı mümkün kılar; bu, canlı sistemlerde izinsiz erişim tespiti, kötü amaçlı kodun bellekteki izlerini bulma veya yanlışlıkla sızdırılan kimlik bilgilerini geri kazanma gibi senaryolarda kritik bir avantaj sağlar. Ayrıca, bellek adli analizi öğrenmek, çekirdek bellek yönetimi, sayfa tablosu yapısı ve ELF biçimi konularında derinlemesine bilgi edinmeyi de sağlar.
+
+## How It Works
+/proc/kcore, çekirdek tarafından çalışma zamanında oluşturulan özel bir cihaz dosyasıdır. Dosya açıldığında, bir ELF64 ET_CORE görüntüsü döner; bu görüntünün program başlık tablosu (program headers), fiziksel bellek aralıklarını tanımlar. Her PT_LOAD tipi giriş, bir fiziksel bellek bölümüyle ilişkili olup, dosyadaki offset’ten o bölüme doğru okuma yaparak ham RAM’e erişebiliriz.
+
+Aşağıdaki Mermaid diyagramı, temel akışı gösterir:
+
+```mermaid
+flowchart TD
+    A[/proc/kcore dosyasını aç] --> B[ELF başlığını oku]
+    B --> C{ELF64 ET_CORE mü?}
+    C -->|Hayır| D[Hata: geçersiz görüntü]
+    C -->|Evet| E[Program başlık tablosunu parse et]
+    E --> F[Her PT_LOAD girişi için]
+    F --> G[Dosya offset ve bellek adresi al]
+    G --> H[Belirtilen uzunlukta veri oku]
+    H --> I[Veriyi tarama/analiz et]
+    I --> J[Sonuçları raporla]
+    J --> K[Dosya tanımlayıcısını kapat]
+```
+
+Adım adım açıklama:
+
+1. **Dosya açma** – `open("/proc/kcore", O_RDONLY)` süper kullanıcı yetkisi gerektirir (`CAP_SYS_ADMIN`).
+2. **ELF başlığı** – İlk 64 bayt `Elf64_Ehdr` yapısını doldurur; `e_type == ET_CORE` ve `e_ident[EI_CLASS] == ELFCLASS64` kontrolü yapılır.
+3. **Program başlıkları** – `e_phoff` ve `e_phentsize` kullanılarak tüm `Elf64_Phdr` girişleri okunur.
+4. **PT_LOAD segmentleri** – `p_type == PT_LOAD` olanlar fiziksel bellek aralıklarını gösterir; `p_offset` dosyadaki başlangıç, `p_filesize` okunacak byte sayısı, `p_paddr` fiziksel adres (bazı çekirdeklerde kullanılmayabilir, sadece offset’e güveniliriz).
+5. **Veri okuma** – `pread(fd, buffer, length, p_offset)` ile doğrudan ilgili bölüme erişilir; bu, sayfa tablosu üzerinden indirekt erişim gerektirmez.
+6. **Tarama** – Elde edilen bellek blokları istediğimiz desen (örneğin bir AES anahtarı, bir JWT imzası) için aranır; bulununca offset ve içerik raporlanır.
+7. **Kapatma** – `close(fd)` ile kaynak serbest bırakılır.
+
+Bu akış, bellek içinde rastgele veri aramak için temel bir şablon sağlar; daha ileri analizlerde sayfa tablosu girişlerini (PTE) çözerek, sadece present sayfaları tarayabilir veya swap’ten gelen sayfaları hariç tutabiliriz.
+
+## Core Concepts
+- **Fiziksel bellek ve sayfalaması** – Çekirdek, fizik RAM’i sayfa boyutlu (genellikle 4096 bayt) bloklara böler. Her sayfa, bir page frame number (PFN) ile tanımlanır ve page table entry (PTE) üzerinden sanal adresle ilişkilendirilir.
+- **ELF core görüntüsü** – `/proc/kcore` bir `ET_CORE` ELF dosyasıdır; bu, bir sürecin bellek dökümü gibi değil, tüm fiziksel belleği kapsar. Program başlık tablosu, her fiziksel bölümü bir `PT_LOAD` segmenti olarak listeler.
+- **Sayfa tablosu girişi (PTE)** – 64‑bit sistemlerde bir PTE 8 bayttır; en düşük birkaç bit present (P), read/write (R/W), user/supervisor (U/S) gibi özellikleri gösterir. Bu bitleri okurak bir sayfanın RAM’de olup olmadığını ya da sadece swap’te mi olduğunu anlayabiliriz.
+- **Yetki modeli** – Dosyaya erişim `CAP_SYS_ADMIN` ya da `CAP_SYS_PTRACE` gerektirir; modern dağıtımlar kde `sysctl kernel.kptr_restrict` ve `kdump` mekanizmalarıyla ek koruma sağlayabilir.
+- **Mmap vs pread** – Bazı örnekler `mmap` kullanır; ancak `pread` ile doğrudan offset okuma, adres alanı parçalanmasını önler ve büyük dosyalar için daha tahmin edilebilir performans sunar.
+
+## Examples & Code Walkthrough
+Aşağıdaki Python betiği, /proc/kcore’u okur, tüm PT_LOAD segmentlerini dolaşır ve verilen bir bayt desenini (örneğin bir sahte gizli anahtar) arar. Gerçek bir adli analizde bu desen bir şifreleme anahtarı, kötü amaçlı shellcode imzası veya sızdırılan credential olabilir.
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+kcore_secret_finder.py – /proc/kcore üzerinden fiziksel RAM'de bir gizli anahtar arar.
+Bu örnek, üretimde doğrudan kullanmak yerine öğrenme ve prototipleme amacıyla hazırlanmıştır.
+"""
+
+import os
+import struct
+import argparse
+import sys
+from typing import List, Tuple
+
+# Sabitler -----------------------------------------------------------------
+PAGE_SIZE = os.sysconf('SC_PAGE_SIZE')
+ELF_CLASS_64 = 2
+ET_CORE = 4
+PT_LOAD = 1
+
+# ELF64_Ehdr (64 byte) ----------------------------------------------------
+EI_NIDENT = 16
+EI_CLASS = 4
+E_TYPE = 16
+E_PHoff = 24
+E_PHOFFSIZE = 42
+E_PHNUM = 44
+
+# ELF64_Phdr (56 byte) ----------------------------------------------------
+P_TYPE = 0
+P_OFFSET = 8
+P_FILESZ = 16
+P_MEMSZ = 24
+P_FLAGS = 32
+P_ALIGN = 40
+
+def read_exact(fd: int, length: int, offset: int) -> bytes:
+    """Belirtilen offset’ten length bayt okur; kısa okuma hatasını fırlatır."""
+    data = bytearray()
+    while len(data) < length:
+        chunk = os.pread(fd, length - len(data), offset + len(data))
+        if not chunk:
+            raise IOError(f"Unexpected EOF while reading {length} bytes at offset {offset}")
+        data.extend(chunk)
+    return bytes(data)
+
+def parse_elf_header(fd: int) -> Tuple[int, int, int]:
+    """ELF başlığını okur, sınıf, tür ve program başlık tablosu bilgilerini döner."""
+    ehdr = read_exact(fd, 64, 0)
+    if ehdr[EI_CLASS] != ELF_CLASS_64:
+        raise ValueError("ELF64 bekleniyordu")
+    e_type = struct.unpack_from("<H", ehdr, E_TYPE)[0]
+    if e_type != ET_CORE:
+        raise ValueError(f"ELF tipi ET_CORE değil: {e_type}")
+    e_phoff = struct.unpack_from("<Q", ehdr, E_PHoff)[0]
+    e_phentsize = struct.unpack_from("<H", ehdr, E_PHOFFSIZE)[0]
+    e_phnum = struct.unpack_from("<H", ehdr, E_PHNUM)[0]
+    return e_phoff, e_phentsize, e_phnum
+
+def parse_program_header(fd: int, phoff: int, entsize: int, index: int) -> dict:
+    """Belirtilen indeksteki program başlığını okur ve sözlük olarak döner."""
+    phdr_off = phoff + index * entsize
+    phdr = read_exact(fd, 56, phdr_off)
+    p_type = struct.unpack_from("<I", phdr, P_TYPE)[0]
+    p_offset = struct.unpack_from("<Q", phdr, P_OFFSET)[0]
+    p_filesz = struct.unpack_from("<Q", phdr, P_FILESZ)[0]
+    p_memsz = struct.unpack_from("<Q", phdr, P_MEMSZ)[0]
+    p_flags = struct.unpack_from("<I", phdr, P_FLAGS)[0]
+    p_align = struct.unpack_from("<Q", phdr, P_ALIGN)[0]
+    return {
+        "type": p_type,
+        "offset": p_offset,
+        "filesz": p_filesz,
+        "memsz": p_memsz,
+        "flags": p_flags,
+        "align": p_align,
+    }
+
+def scan_for_pattern(fd: int, pattern: bytes) -> List[Tuple[int, bytes]]:
+    """Tüm PT_LOAD segmentlerini tarar, pattern ile eşleşen offsets’i döner."""
+    matches: List[Tuple[int, bytes]] = []
+    phoff, entsize, phnum = parse_elf_header(fd)
+    for i in range(phnum):
+        ph = parse_program_header(fd, phoff, entsize, i)
+        if ph["type"] != PT_LOAD:
+            continue
+        # Dosyada gerçekte bulunan veri boyutu filesz
+        if ph["filesz"] == 0:
+            continue
+        data = read_exact(fd, ph["filesz"], ph["offset"])
+        # Basit bytes.find döngüsü; gerçek uygulamada Boyer-Moore gibi hızlı algoritma tercih edilebilir.
+        start = 0
+        while True:
+            idx = data.find(pattern, start)
+            if idx == -1:
+                break
+            abs_offset = ph["offset"] + idx
+            matches.append((abs_offset, data[idx:idx+len(pattern)]))
+            start = idx + 1
+    return matches
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Find a byte pattern in /proc/kcore")
+    parser.add_argument(
+        "-p", "--pattern",
+        required=True,
+        help="Hex encoded pattern to search for (e.g. deadbeefcafebabe)",
+    )
+    args = parser.parse_args()
+    try:
+        pattern = bytes.fromhex(args.pattern)
+    except ValueError:
+        sys.exit("Pattern must be a valid hex string")
+    if len(pattern) == 0:
+        sys.exit("Pattern cannot be empty")
+
+    fd = os.open("/proc/kcore", os.O_RDONLY)
+    try:
+        hits = scan_for_pattern(fd, pattern)
+        if not hits:
+            print("Pattern not found in /proc/kcore")
+        else:
+            print(f"Found {len(hits)} occurrence(s):")
+            for off, data in hits:
+                print(f"  offset 0x{off:x}: {data.hex()}")
+    finally:
+        os.close(fd)
+
+if __name__ == "__main__":
+    main()
+```
+
+**Kod açıklaması**
+
+- `read_exact` fonksiyonu, `pread` ile kısa okuma durumlarını yönetir; bu, büyük bellek bloklarında güvenilir okuma sağlar.
+- ELF başlığı ve program başlıkları `struct.unpack_from` ile little‑endian olarak okunur; bu, çekirdek tarafından üretilen görüntünün standart ELF64 biçimini varsayar.
+- `scan_for_pattern` fonksiyonu, sadece `PT_LOAD` segmentlerini dolaşır; her segmentin `filesz` kısmı kadar veri okunur ve Python’un yerleşik `bytes.find` yöntemiyle desen aranır. Gerçek üretimde bu adım, çok büyük bloklar için bellek içinde ikili arama ya da Boyer‑Moore gibi lineer zamanlı algoritmalarla optimize edilebilir.
+- Bulunan her eşleşme, dosya offset’i (sanal fiziksel adres yerine) ve eşleşen veri olarak raporlanır; bu offset, `/proc/iomem` veya `/proc/kpageflags` gibi diğer kaynaklarla ilişkilendirilebilir.
+
+Bu betik, root yetkisi ile çalıştırıldığında bir desenin bellekteki konumunu hızlıca verir; gerçek bir adli olayda elde edilen offset’ten çevreleyen sayfaları inceleyerek daha geniş bağlamı çıkartılabilir.
+
+## Best Practices
+- **En az ayrıntı ilkesi** – /proc/kcore okuma işlemi sadece gerekli süreçlerde (örneğin geçici bir adli toplama betiği) ve sadece root yetkisiyle yapılmalı. İşlem tamamlandığında dosya tanımlayıcısı hemen kapatılmalı.
+- **Offset doğrulama** – Okunan veri boyutu, `p_filesz` ile sınırlı olmalı; `p_memsz` daha büyük olabilir (başta sıfırlı sayfalar) ve bu bölüme okuma yapmak gereksiz sistem çağrısı yapar.
+- **Paralel tarama** – Çok çekirdekli sistemlerde, her `PT_LOAD` segmentini ayrı bir iş parçacığı veya proses içinde tarayabilirsiniz; bu, toplam süreyi lineer şekilde azaltır.
+- ** Bellek sınırlaması** – Tek seferde tüm belleği belleğe yüklemek yerine, akış tabanlı okuma (yukarıdaki gibi) kullanın; aksi takdirde sistem takas yapabilir veya OOM’ye yol açabilir.
+- ** Günlük ve denetim** – /proc/kcore erişimi `auditd` ile izlenmelidir; yetkisiz erişim denemeleri sürekli olarak raporlanmalıdır.
+- ** Yazılım dağıtımı** – Bu tip araçlar, üretim ortamında sürekli çalıştırılmamalı; yalnızca yanıt planı (incident response) kapsamında, önceden onaylı bir ortamda kullanılmalıdır.
+
+## Common Mistakes & Anti-Patterns
+| Hata / Anti-Pattern | Açıklama | Düzeltme |
+|---------------------|----------|----------|
+| **Root olmadan okuma denemesi** | `/proc/kcore` okuma işlemi `EPERM` hatası verir; betik bu hatayı yakalamadan çöker. | `os.open` çağrısını `try/except` bloğu içinde yakalayın, kullanıcıya yetki gerektiğini açık bir mesajla bildirin. |
+| **p_filesz yerine p_memsz kullanımı** | `p_memsz` başta sıfırlı sayfaları içerir; bu bölümü okumaya çalış

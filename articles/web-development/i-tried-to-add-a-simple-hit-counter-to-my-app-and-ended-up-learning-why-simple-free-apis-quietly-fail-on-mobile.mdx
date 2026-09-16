@@ -1,0 +1,263 @@
+---
+title: "I tried to add a simple hit counter to my app and ended up learning why \"simple\" free APIs quietly fail on mobile"
+slug: "i-tried-to-add-a-simple-hit-counter-to-my-app-and-ended-up-learning-why-simple-free-apis-quietly-fail-on-mobile"
+description: "I wanted to track how many times a screen was viewed in a React Native app. The obvious solution looked like a single `fetch` call to a free analytics endpoint...."
+category: "Web Development"
+tags: ["counter", "simple", "web development", "tried"]
+keywords: ["programming", "web development", "tried", "counter", "software engineering", "tech guide", "simple"]
+author: "Lead Frontend & Web Architect"
+publishedAt: "2026-09-16"
+readingTime: "9 min read"
+---
+
+# I tried to add a simple hit counter to my app and ended up learning why "simple" free APIs quietly fail on mobile
+
+## Introduction
+I wanted to track how many times a screen was viewed in a React Native app. The obvious solution looked like a single `fetch` call to a free analytics endpoint. I dropped it into a button handler, ran the app on my phone over Wi‑Fi, and saw the counter increment. It felt like magic—just a few lines and I had analytics.
+
+That confidence vanished the moment I tested on a spotty cellular connection, or when I backgrounded the app and reopened it later. Requests disappeared, duplicates appeared, and the server sometimes returned 429 responses I hadn’t anticipated. What seemed trivial on desktop turned into a cascade of mobile‑specific failures that were silent, hard to reproduce, and easy to miss in testing.
+
+## Why This Matters
+Mobile networks are unreliable by design. Users flip between Wi‑Fi and LTE, enter elevators, or enable airplane mode. Operating systems aggressively suspend background work to preserve battery. If you treat an analytics endpoint as a fire‑and‑forget HTTP call, you will lose data, inflate metrics with duplicates, or trigger rate limits without any visible error. The cost isn’t just inaccurate numbers; it’s wasted engineering time debugging phantom spikes and lost trust in the data you rely on for product decisions.
+
+Any team that ships a mobile product needs to treat even the “simplest” external call as a distributed system problem. Recognizing the failure modes up front lets you build a resilient pipeline that degrades gracefully instead of failing silently.
+
+## How It Works
+The pattern that solved my hit‑counter woes is an offline‑first queue with reliable retry semantics. Events are persisted locally immediately, sent only when the network is available, and retried with exponential backoff. Idempotency keys prevent double counting, and batching reduces radio usage.
+
+Below is a flowchart that shows the life cycle of a single “page_view” event from user tap to server acknowledgment.
+
+```mermaid
+flowchart TD
+    A[User Tap<br>Triggers "page_view" event] --> B{Local Queue<br>AsyncStorage/SQLite}
+    B --> C{Network State<br>NetInfo Check}
+    
+    C -- Online --> D[Send Batch<br>Compressed JSON]
+    C -- Offline --> E[Queue Stays<br>Local Persistence]
+    
+    D --> F{HTTP Response<br>200/4xx/5xx}
+    
+    F -- Success --> G[Remove from Queue<br>Idempotency Key Validated]
+    F -- Timeout/5xx --> H[Exponential Backoff<br>Re-queue with Delay]
+    F -- 4xx (Client Error) --> I[Permanent Failure<br>Log & Alert]
+    
+    E --> J[Background Sync<br>App Foreground/Network Change]
+    J --> C
+    
+    H --> K[Retry Loop<br>Max Attempts?]
+    K -- Yes --> D
+    K -- No --> L[Dead Letter Queue<br>Manual Intervention]
+    
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style D fill:#bbf,stroke:#333,stroke-width:2px
+    style E fill:#fbf,stroke:#333,stroke-width:2px
+    style L fill:#f88,stroke:#333,stroke-width:2px
+```
+
+**Walkthrough**
+
+1. **Event creation** – A UI interaction dispatches a plain JavaScript object `{type: 'page_view', screen: 'Home', ts: Date.now()}`.
+2. **Local persistence** – The object is stringified and pushed into a queue stored in `AsyncStorage` (or a lightweight SQLite/Realm table). This guarantees the event survives app kill or background suspend.
+3. **Network check** – Using `@react-native-community/netinfo` we subscribe to connectivity changes. When online, we attempt a send; when offline we simply wait.
+4. **Batching & compression** – We pull up to 50 items, gzip the JSON payload, and set `Content-Encoding: gzip`. This reduces radio wake‑ups and saves bandwidth.
+5. **Transmission** – `fetch` (or `axios`) posts to the endpoint with a short timeout (8 s). On success we receive a 200 and the server echoes back the idempotency key we supplied.
+6. **Success handling** – The key is verified against a local set of recently processed keys; if it matches we delete the batch from the queue.
+7. **Retry logic** – On timeout, network error, or 5xx we calculate a delay (`base * 2^attempt`) with jitter, re‑queue the batch, and resume after the pause.
+8. **Permanent errors** – 4xx responses (bad request, auth failure) are considered unrecoverable; we log them to a local error store and optionally forward to a crash‑reporting service.
+9. **Background sync** – The NetInfo listener triggers a send attempt whenever the device regains connectivity or the app returns to the foreground, ensuring queued events eventually drain.
+10. **Dead‑letter queue** – After a configurable maximum number of attempts (e.g., 7) we move the batch to a separate store for manual inspection, preventing infinite retry loops.
+
+## Core Concepts
+- **Offline‑first persistence** – Treat the local queue as the source of truth; network is an optional transport.
+- **Idempotency** – Each event carries a unique key (often a UUID v4 or a hash of payload + timestamp). The server must guarantee that presenting the same key twice results in no side effect.
+- **Exponential backoff with jitter** – Prevents thundering herd problems when many devices recover from an outage simultaneously.
+- **Batching** – Amortizes the cost of TLS handshakes and radio activation; improves throughput on high‑latency links.
+- **Dead‑letter queue** – Isolates poisoned messages so they don’t clog the retry pipeline.
+- **Network state awareness** – Reacting to `NetInfo` changes avoids wasteful attempts while offline and promptly drains the queue when connectivity returns.
+
+## Examples & Code Walkthrough
+Below are concrete snippets from a React Native project using `@react-native-async-storage/async-storage`, `@react-native-community/netinfo`, and `p-limit` for concurrency control.
+
+### 1. Naïve implementation (what I started with)
+```javascript
+// ❌ Do not copy this to production
+export const trackView = async (screenName) => {
+  await fetch('https://free-analytics.example.com/hit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ screen: screenName, ts: Date.now() }),
+  });
+};
+```
+This works on a reliable Wi‑Fi connection but fails silently when the device loses middleware or the app is backgrounded.
+
+### 2. Resilient queue helper
+```javascript
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import NetInfo from '@react-native-community/netinfo';
+import pLimit from 'p-limit';
+
+const QUEUE_KEY = 'hit_counter_queue';
+const IDEMPOTENCY_KEY_SET = 'hit_counter_idempotency';
+const BATCH_SIZE = 50;
+const BASE_BACKOFF_MS = 500;
+const MAX_ATTEMPTS = 7;
+
+// Internal helpers -------------------------------------------------
+const getQueue = async () => {
+  const raw = await AsyncStorage.getItem(QUEUE_KEY);
+  return raw ? JSON.parse(raw) : [];
+};
+
+const setQueue = async (queue) => {
+  await AsyncStorage.setItem(QUEUE_KEY, JSON.stringify(queue));
+};
+
+const addIdempotency = async (key) => {
+  const set = await AsyncStorage.getItem(IDEMPOTENCY_KEY_SET);
+  const ids = new Set(set ? JSON.parse(set) : []);
+  ids.add(key);
+  await AsyncStorage.setItem(IDEMPOTENCY_KEY_SET, JSON.stringify([...ids]));
+};
+
+const hasBeenProcessed = async (key) => {
+  const set = await AsyncStorage.getItem(IDEMPOTENCY_KEY_SET);
+  return set ? new Set(JSON.parse(set)).has(key) : false;
+};
+
+// Core enqueue -----------------------------------------------------
+export const enqueueHit = async (payload) => {
+  const idempotencyKey = `${payload.screen}-${payload.ts}-${Math.random()}`;
+  const event = { ...payload, idempotencyKey };
+  const queue = await getQueue();
+  queue.push(event);
+  await setQueue(queue);
+  // Trigger an immediate send attempt if we are online
+  const netState = await NetInfo.fetch();
+  if (netState.isConnected) {
+    attemptSend();
+  }
+};
+
+// Sending logic ----------------------------------------------------
+const limit = pLimit(1); // Serialize sends to avoid race conditions
+
+export const attemptSend = async () => {
+  return limit(async () => {
+    const queue = await getQueue();
+    if (queue.length === 0) return;
+
+    const batch = queue.slice(0, BATCH_SIZE);
+    const payload = JSON.stringify(batch);
+    // Gzip the payload – using a tiny wrapper like pako
+    const compressed = pako.gzip(payload, { to: 'string' });
+
+    try {
+      const response = await fetch('https://free-analytics.example.com/hit/batch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Encoding': 'gzip',
+        },
+        body: compressed,
+        timeout: 8000,
+      });
+
+      if (!response.ok) {
+        // Treat 4xx as permanent, 5xx as transient
+        if (response.status >= 400 && response.status < 500) {
+          console.error(`Permanent error ${response.status}`);
+          // Move to dead‑letter queue (omitted for brevity)
+          await removeFromQueue(batch);
+        } else {
+          throw new Error(`Server error ${response.status}`);
+        }
+        return;
+      }
+
+      const result = await response.json();
+      // Expect server to echo back the keys it processed
+      for (const key of result.processedKeys) {
+        await addIdempotency(key);
+      }
+      await removeFromQueue(batch);
+    } catch (err) {
+      // Transient failure – schedule retry with backoff
+      console.warn(`Send failed: ${err.message}`);
+      await scheduleRetry(batch);
+    }
+  });
+};
+
+const removeFromQueue = async (batch) => {
+  const queue = await getQueue();
+  const idsToRemove = new Set(batch.map((e) => e.idempotencyKey));
+  const filtered = queue.filter((e) => !idsToRemove.has(e.idempotencyKey));
+  await setQueue(filtered);
+};
+
+const scheduleRetry = async (batch) => {
+  // Find the highest attempt count among the batch items
+  const attempts = Math.max(...batch.map((e) => e.attempt || 0)) + 1;
+  if (attempts > MAX_ATTEMPTS) {
+    // Move to dead‑letter queue (implementation omitted)
+    console.error('Max attempts reached, moving to DLQ');
+    await removeFromQueue(batch);
+    return;
+  }
+  const delay = BASE_BACKOFF_MS * Math.pow(2, attempts) + Math.random() * 100;
+  // Stamp each event with its attempt number for next round
+  const stamped = batch.map((e) => ({ ...e, attempt: attempts }));
+  // Re‑queue after delay
+  setTimeout(async () => {
+    const queue = await getQueue();
+    queue.push(...stamped);
+    await setQueue(queue);
+    attemptSend();
+  }, delay);
+};
+
+// NetInfo listener – kick off sends when connectivity changes
+NetInfo.addEventListener((state) => {
+  if (state.isConnected) {
+    attemptSend();
+  }
+});
+```
+**Explanation of key parts**
+
+- **Idempotency key** – Combines screen, timestamp, and a random component to make collisions astronomically unlikely while still being reproducible if the same logical event is resent.
+- **Batch compression** – `pako.gzip` reduces payload size; the server must decompress before parsing.
+- **Attempt tracking** – Each event carries an `attempt` field so we know when to stop retrying.
+- **NetInfo hook** – Guarantees we try to flush the queue as soon as the radio comes back up.
+- **Dead‑letter handling** – When `attempts > MAX_ATTEMPTS` we move the batch to a separate store (not shown) for operator review.
+
+### 3. Server‑side idempotency (pseudo‑code)
+```python
+# Example in Node/Express
+app.post('/hit/batch', async (req, res) => {
+  const events = req.body; // already decompressed by middleware
+  const keys = events.map(e => e.idempotencyKey);
+  // Insert with ON CONFLICT DO NOT NULL (Postgres) or DynamoDB conditional write
+  await db.hits.insertMany(events, { ordered: false });
+  res.json({ processedKeys: keys });
+});
+```
+The backend must guarantee that submitting the same key twice does not create a duplicate row.
+
+## Best Practices
+- **Persist before you send** – Never rely on in‑memory queues; a sudden suspend can wipe them.
+- **Make every outbound call idempotent** – Choose a key that is deterministic for a logical event but unique across retries.
+- **Bound your retry attempts** – Unbounded retries can drain battery and clog storage.
+- **Use exponential backoff with jitter** – Prevents synchronized retries after network outages.
+- **Batch aggressively, but respect payload limits** – Typical mobile APIs accept up to 1 MB; compress to stay well under.
+- **Monitor queue depth** – Alert when the local queue grows beyond a threshold; it signals persistent delivery problems.
+- **Separate transient and permanent errors** – 4xx responses should not be retried; 5xx and timeouts should.
+- **Leverage platform primitives** – `NetInfo`, `WorkManager` (Android), or `BGTaskScheduler` (iOS) for background sync when the app is not in the foreground.
+- **Test failure modes** – Use tools like Charles Proxy, Network Link Conditioner, or airplane‑mode toggles to validate the queue drains correctly.
+
+## Common Mistakes & Anti-Patterns
+| Mistake | Why it’s harmful | Fix |
+|---------|------------------|-----|
+| **Fire‑and‑forget `fetch` without error handling** | Silently drops hits on any network glitch; no visibility into loss. | Wrap the call in `try/catch`, inspect status codes, and route failures to a retry queue. |
+|

@@ -1,0 +1,379 @@
+---
+title: "Open Call: an agent that says where every hackathon fact came from"
+slug: "open-call-an-agent-that-says-where-every-hackathon-fact-came-from"
+description: "Last spring I sat in a Discord voice channel with three other maintainers, watching a hackathon's \"live updates\" channel fill with contradictory claims. One bot..."
+category: "Artificial Intelligence"
+tags: ["agent", "artificial intelligence", "call", "open"]
+keywords: ["artificial intelligence", "open", "software engineering", "agent", "programming", "tech guide", "call"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-09-26"
+readingTime: "10 min read"
+---
+
+# Open Call: an agent that says where every hackathon fact came from
+
+## Introduction
+
+Last spring I sat in a Discord voice channel with three other maintainers, watching a hackathon's "live updates" channel fill with contradictory claims. One bot announced the winner before the judges had deliberated. Another scraped a sponsor's tweet and presented it as an official rule change. By the time the closing ceremony started, nobody could tell which facts were real and which were hallucinated by over-eager automation.
+
+That mess is why we built Open Call. It's not another dashboard. It's an agent that treats provenance as a first-class citizen—every fact it surfaces carries a machine-readable chain of custody back to the original source. GitHub webhook? The payload and timestamp. Twitch clip? The VOD offset and chat log. Tweet? The API response with rate-limit headers preserved. When someone asks "where did this come from?", the answer isn't a footnote—it's a traversable graph.
+
+## Why This Matters
+
+Hackathons are high-velocity, low-trust environments. Organizers publish schedule changes across five platforms. Sponsors drop API keys in Discord announcements. Participants ship repos at 3 AM with READMEs that reference APIs that don't exist yet. Traditional aggregators flatten all of this into a feed, stripping away the context that lets you judge reliability.
+
+The production pain point isn't theoretical. We've seen:
+- A team waste six hours integrating a "new API endpoint" announced in a sponsor's blog post that turned out to be a draft published by mistake
+- Judges disqualify a project because a bot incorrectly reported the submission deadline
+- Sponsors complain that their prize categories were misrepresented in the final leaderboard
+
+Provenance tracking solves this by making the *derivation* of each fact inspectable. Not "source: Twitter" but "source: Twitter API v2, tweet ID 178923456789, fetched at 2024-03-15T03:22:11Z, rate-limit remaining: 412, author verified: true". That granularity lets downstream consumers—whether humans or other agents—apply their own trust policies.
+
+## How It Works
+
+The agent runs as a stateless async service. Incoming queries hit a thin API layer that fans out to registered source adapters. Each adapter knows how to authenticate, paginate, and normalize its source into a canonical `Fact` object. Crucially, the adapter *also* emits a `ProvenanceRecord` that captures every decision made during extraction: which fields were mapped, which were dropped, what transformations applied, and the raw response bytes (truncated at a configurable threshold).
+
+```mermaid
+flowchart TD
+    Client[Client Query] --> Gateway[API Gateway\n/FastAPI]
+    Gateway --> Router[Query Router]
+    Router --> Registry[Plugin Registry]
+    Registry --> Adapters[Source Adapters\n(GitHub, Twitter, RSS, Webhook, ...)]
+    Adapters --> Normalizer[Fact Normalizer]
+    Normalizer --> Provenance[Provenance Builder]
+    Provenance --> Store[(Provenance Store\nRedis + SQLite)]
+    Store --> Response[Response Builder]
+    Response --> Cache[Response Cache\nTTL: 30s]
+    Cache --> Client
+    
+    subgraph "Adapter Internals"
+        Adapters --> Auth[Auth Manager]
+        Adapters --> RateLimit[Rate Limiter\nToken Bucket]
+        Adapters --> Paginator[Paginator\nCursor/Offset]
+        Adapters --> RawCapture[Raw Response Capture]
+    end
+    
+    style Gateway fill:#e1f5fe
+    style Registry fill:#fff3e0
+    style Store fill:#fce4ec
+    style Cache fill:#e8f5e9
+```
+
+The flow is intentionally linear. No hidden event loops, no background workers mutating shared state. The `ProvenanceBuilder` assembles a directed acyclic graph where each node is immutable once written. That graph gets serialized as JSON-LD so it can be consumed by other tools without custom parsers.
+
+## Core Concepts
+
+### The Fact Object
+
+```python
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+import uuid
+
+@dataclass(frozen=True, slots=True)
+class Fact:
+    """Immutable fact with embedded provenance reference."""
+    id: str = field(default_factory=lambda: f"fact-{uuid.uuid4().hex[:12]}")
+    claim: str = ""
+    category: str = "general"  # announcement, winner, rule_change, schedule, etc.
+    confidence: float = 0.0    # 0.0-1.0, set by extractor
+    provenance_id: str = ""    # foreign key to ProvenanceRecord
+    extracted_at: datetime = field(default_factory=datetime.utcnow)
+    expires_at: Optional[datetime] = None  # for time-sensitive facts
+    
+    def __post_init__(self):
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be in [0.0, 1.0]")
+        if not self.claim.strip():
+            raise ValueError("claim cannot be empty")
+```
+
+Immutability matters. Once a `Fact` enters the system, it never changes. Corrections arrive as new facts with a `supersedes` relationship in the provenance graph.
+
+### Provenance Record
+
+```python
+@dataclass(frozen=True, slots=True)
+class ProvenanceRecord:
+    """Complete audit trail for a single fact extraction."""
+    id: str = field(default_factory=lambda: f"prov-{uuid.uuid4().hex[:12]}")
+    fact_id: str = ""
+    source_adapter: str = ""           # e.g., "github-webhook", "twitter-api-v2"
+    source_identifier: str = ""        # e.g., "repo:org/repo", "tweet:178923456789"
+    raw_response_hash: str = ""        # SHA256 of captured raw bytes
+    raw_response_truncated: bytes = b"" # First 8KB of raw response
+    extraction_rules_version: str = "" # Semver of the extractor logic
+    transformations: tuple[str, ...] = ()  # Ordered list of applied transforms
+    adapter_metadata: dict = field(default_factory=dict)  # Rate limits, auth method, etc.
+    fetched_at: datetime = field(default_factory=datetime.utcnow)
+    fetch_duration_ms: int = 0
+    
+    def to_jsonld(self) -> dict:
+        """Serialize as JSON-LD for interoperability."""
+        return {
+            "@context": "https://schema.org/",
+            "@type": "ProvenanceRecord",
+            "identifier": self.id,
+            "about": {"@id": f"urn:fact:{self.fact_id}"},
+            "sourceOrganization": self.source_adapter,
+            "sourceIdentifier": self.source_identifier,
+            "contentHash": f"sha256:{self.raw_response_hash}",
+            "extractionMethod": self.extraction_rules_version,
+            "transformationSteps": list(self.transformations),
+            "metadata": self.adapter_metadata,
+            "dateCreated": self.fetched_at.isoformat() + "Z",
+            "fetchDuration": self.fetch_duration_ms
+        }
+```
+
+The `raw_response_truncated` field is a deliberate compromise. Storing full responses from high-volume sources (GitHub webhooks during a 48-hour hackathon can hit 10k events/minute) blows up storage. We capture enough to debug extraction logic—headers, first 8KB of body—and hash the rest for integrity verification.
+
+### Source Adapter Interface
+
+```python
+from abc import ABC, abstractmethod
+from typing import AsyncIterator
+import asyncio
+
+class SourceAdapter(ABC):
+    """Base class for all source adapters. Implementations must be stateless."""
+    
+    name: str = "base"
+    version: str = "0.0.0"
+    rate_limit: int = 60  # requests per minute
+    
+    def __init__(self, config: dict):
+        self.config = config
+        self._rate_limiter = TokenBucket(rate=self.rate_limit, per=60)
+        self._session: Optional[aiohttp.ClientSession] = None
+    
+    async def __aenter__(self):
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10),
+            headers={"User-Agent": f"OpenCall/{__version__} ({self.name})"}
+        )
+        return self
+    
+    async def __aexit__(self, *args):
+        if self._session:
+            await self._session.close()
+    
+    @abstractmethod
+    async def fetch_raw(self, query: dict) -> AsyncIterator[RawResponse]:
+        """Yield raw responses from the source. Handle pagination internally."""
+        pass
+    
+    @abstractmethod
+    def extract_facts(self, raw: RawResponse) -> list[ExtractedFact]:
+        """Transform a raw response into candidate facts. Pure function, no I/O."""
+        pass
+    
+    async def process(self, query: dict) -> AsyncIterator[tuple[Fact, ProvenanceRecord]]:
+        """Main entry point. Orchestrates fetch -> extract -> provenance."""
+        async for raw in self.fetch_raw(query):
+            await self._rate_limiter.acquire()
+            start = time.perf_counter()
+            
+            facts = self.extract_facts(raw)
+            for extracted in facts:
+                fact, provenance = self._build_provenance(extracted, raw, start)
+                yield fact, provenance
+    
+    def _build_provenance(self, extracted: ExtractedFact, raw: RawResponse, 
+                          start: float) -> tuple[Fact, ProvenanceRecord]:
+        # Implementation omitted for brevity - sees Examples section
+        ...
+```
+
+The adapter pattern keeps the core ignorant of source specifics. Adding a new source means writing one class that implements `fetch_raw` (handles auth, pagination, retries) and `extract_facts` (pure transformation logic). The `process` method handles the cross-cutting concerns: rate limiting, timing, provenance assembly.
+
+## Examples & Code Walkthrough
+
+Here's a production-ready GitHub webhook adapter. It handles the actual payload structure GitHub sends, verifies signatures, and extracts hackathon-relevant facts (new releases, issue comments with specific labels, workflow run conclusions).
+
+```python
+# adapters/github_webhook.py
+import hmac
+import hashlib
+import json
+import logging
+from typing import AsyncIterator
+from dataclasses import dataclass
+
+import aiohttp
+from aiohttp import web
+
+from opencall.core import SourceAdapter, RawResponse, ExtractedFact, Fact, ProvenanceRecord
+
+logger = logging.getLogger(__name__)
+
+@dataclass(slots=True)
+class GitHubWebhookConfig:
+    secret: str
+    allowed_events: frozenset[str] = frozenset({
+        "release", "issues", "issue_comment", "workflow_run", "push"
+    })
+    hackathon_labels: frozenset[str] = frozenset({
+        "hackathon", "hackathon-announcement", "hackathon-winner", "hackathon-schedule"
+    })
+
+class GitHubWebhookAdapter(SourceAdapter):
+    name = "github-webhook"
+    version = "1.2.0"
+    rate_limit = 5000  # GitHub allows high throughput for verified webhooks
+    
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.cfg = GitHubWebhookConfig(**config)
+        self._verify_signature = self._make_verifier(self.cfg.secret)
+    
+    @staticmethod
+    def _make_verifier(secret: str):
+        def verify(payload: bytes, signature_header: str) -> bool:
+            if not signature_header.startswith("sha256="):
+                return False
+            expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+            return hmac.compare_digest(expected, signature_header[7:])
+        return verify
+    
+    # Webhook adapters don't poll - they receive. fetch_raw yields from an internal queue.
+    async def fetch_raw(self, query: dict) -> AsyncIterator[RawResponse]:
+        # In practice, this adapter is driven by an HTTP handler that pushes to a queue.
+        # The queue is drained here. See the HTTP handler below.
+        queue: asyncio.Queue[RawResponse] = query["_internal_queue"]
+        while True:
+            raw = await queue.get()
+            yield raw
+    
+    def extract_facts(self, raw: RawResponse) -> list[ExtractedFact]:
+        event = raw.headers.get("X-GitHub-Event", "")
+        if event not in self.cfg.allowed_events:
+            return []
+        
+        try:
+            payload = json.loads(raw.body)
+        except json.JSONDecodeError as e:
+            logger.warning("Invalid JSON in webhook: %s", e)
+            return []
+        
+        facts = []
+        
+        if event == "release" and payload.get("action") == "published":
+            facts.append(self._extract_release_fact(payload))
+        
+        elif event in ("issues", "issue_comment"):
+            facts.extend(self._extract_issue_facts(payload, event))
+        
+        elif event == "workflow_run" and payload.get("action") == "completed":
+            facts.append(self._extract_workflow_fact(payload))
+        
+        return [f for f in facts if f is not None]
+    
+    def _extract_release_fact(self, payload: dict) -> ExtractedFact | None:
+        release = payload.get("release", {})
+        repo = payload.get("repository", {})
+        tag = release.get("tag_name", "")
+        name = release.get("name", tag)
+        body = release.get("body", "").strip()
+        
+        claim = f"New release {name} ({tag}) published in {repo.get('full_name')}"
+        if body:
+            claim += f": {body[:200]}"
+        
+        return ExtractedFact(
+            claim=claim,
+            category="announcement",
+            confidence=0.95,
+            source_identifier=f"repo:{repo.get('full_name')}:release:{release.get('id')}",
+            metadata={
+                "html_url": release.get("html_url"),
+                "author": release.get("author", {}).get("login"),
+                "prerelease": release.get("prerelease", False),
+                "draft": release.get("draft", False)
+            }
+        )
+    
+    def _extract_issue_facts(self, payload: dict, event: str) -> list[ExtractedFact]:
+        issue = payload.get("issue", {})
+        labels = {lbl["name"].lower() for lbl in issue.get("labels", [])}
+        hackathon_labels = labels & self.cfg.hackathon_labels
+        
+        if not hackathon_labels:
+            return []
+        
+        facts = []
+        action = payload.get("action", "")
+        
+        if event == "issues" and action in ("opened", "edited", "labeled"):
+            facts.append(ExtractedFact(
+                claim=f"Issue #{issue.get('number')}: {issue.get('title')}",
+                category="announcement" if "announcement" in hackathon_labels else "general",
+                confidence=0.85,
+                source_identifier=f"issue:{issue.get('repository_url')}/{issue.get('number')}",
+                metadata={
+                    "labels": list(labels),
+                    "author": issue.get("user", {}).get("login"),
+                    "state": issue.get("state"),
+                    "html_url": issue.get("html_url")
+                }
+            ))
+        
+        elif event == "issue_comment" and action == "created":
+            comment = payload.get("comment", {})
+            facts.append(ExtractedFact(
+                claim=f"Comment on #{issue.get('number')}: {comment.get('body', '')[:300]}",
+                category="general",
+                confidence=0.75,
+                source_identifier=f"comment:{comment.get('id')}",
+                metadata={
+                    "author": comment.get("user", {}).get("login"),
+                    "html_url": comment.get("html_url"),
+                    "issue_labels": list(labels)
+                }
+            ))
+        
+        return facts
+    
+    def _extract_workflow_fact(self, payload: dict) -> ExtractedFact | None:
+        run = payload.get("workflow_run", {})
+        repo = payload.get("repository", {})
+        conclusion = run.get("conclusion", "")
+        
+        if conclusion not in ("success", "failure", "cancelled", "timed_out"):
+            return None
+        
+        workflow_name = run.get("name", "unknown workflow")
+        branch = run.get("head_branch", "")
+        
+        claim = f"Workflow '{workflow_name}' {conclusion} on {branch} in {repo.get('full_name')}"
+        
+        return ExtractedFact(
+            claim=claim,
+            category="general",
+            confidence=0.9,
+            source_identifier=f"workflow:{run.get('id')}",
+            metadata={
+                "workflow_name": workflow_name,
+                "conclusion": conclusion,
+                "branch": branch,
+                "html_url": run.get("html_url"),
+                "run_number": run.get("run_number")
+            }
+        )
+    
+    def _build_provenance(self, extracted: ExtractedFact, raw: RawResponse, 
+                          start: float) -> tuple[Fact, ProvenanceRecord]:
+        fact = Fact(
+            claim=extracted.claim,
+            category=extracted.category,
+            confidence=extracted.confidence,
+            provenance_id=""  # filled in below
+        )
+        
+        raw_bytes = raw.body
+        raw_hash = hashlib.sha256(raw_bytes).hexdigest()
+        truncated = raw_bytes[:8192]
+        
+        provenance = ProvenanceRecord(
+            fact_id=fact.id

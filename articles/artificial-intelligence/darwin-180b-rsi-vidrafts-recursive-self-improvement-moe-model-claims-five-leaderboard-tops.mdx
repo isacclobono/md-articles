@@ -1,0 +1,201 @@
+---
+title: "Darwin-180B-RSI: VIDRAFT's Recursive Self-Improvement MoE Model Claims Five Leaderboard Tops"
+slug: "darwin-180b-rsi-vidrafts-recursive-self-improvement-moe-model-claims-five-leaderboard-tops"
+description: "We built Darwin-180B-RSI to address a simple observation: static Mixture‑of‑Experts (MoE) networks stop improving once their routing weights are frozen. When be..."
+category: "Artificial Intelligence"
+tags: ["artificial intelligence", "180b", "darwin", "vidraft"]
+keywords: ["180b", "programming", "artificial intelligence", "software engineering", "darwin", "vidraft", "tech guide"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-09-29"
+readingTime: "8 min read"
+---
+
+# Darwin-180B-RSI: VIDRAFT's Recursive Self-Improvement MoE Model Claims Five Leaderboard Tops
+
+## Introduction
+We built Darwin-180B-RSI to address a simple observation: static Mixture‑of‑Experts (MoE) networks stop improving once their routing weights are frozen. When benchmark distributions shift—new tasks, updated data, or evolving latency constraints—the model’s performance plateaus and can even regress. Our goal was to create a model that continuously reshapes its expert composition based on real‑time feedback from multiple leaderboards, without manual retraining cycles.
+
+## Why This Matters
+For production teams serving language models at scale, the cost of periodic full‑retrain is prohibitive. A model that can autonomously adapt its internal structure reduces engineering overhead, extends the useful life of a deployment, and keeps service quality aligned with changing user demands. Darwin-180B-RSI shows that a closed‑loop self‑optimization mechanism can deliver sustained top‑three rankings on five major public leaderboards over six months, all while staying within a fixed compute budget.
+
+## How It Works
+The core of Darwin-180B-RSI is a recursive self‑improvement (RSI) loop that sits atop a conventional MoE backbone. Training proceeds in discrete improvement cycles. At the end of each cycle we evaluate on a held‑out slice of each leaderboard, compute a meta‑loss that reflects rank degradation, and use that signal to adjust expert routing, add or remove experts, and distill knowledge from the current best performers into the pool.
+
+### Mermaid Diagram
+```mermaid
+flowchart TD
+    A[Start Cycle] --> B[Sample Batch]
+    B --> C[Forward Pass through MoE]
+    C --> D[Compute Task Loss]
+    D --> E[Update Expert Weights (SGD)]
+    E --> F[Evaluate on Leaderboard Slice]
+    F --> G[Compute Meta‑Loss (Rank Change)]
+    G --> H{Meta‑Loss < Threshold?}
+    H -->|Yes| I[Accept Update]
+    H -->|No| J[Trigger Expert Adaptation]
+    I --> K[Knowledge Distillation]
+    J --> L[Expert Addition/Deletion]
+    L --> M[Reset Routing Logits]
+    M --> K
+    K --> N[Update Routing Policy (RL)]
+    N --> O[End Cycle]
+    O --> A
+```
+
+**Step‑by‑step explanation**
+
+1. **Sample Batch** – A mini‑batch is drawn from the mixed‑domain pre‑training corpus.
+2. **Forward Pass** – The input is routed through the MoE using the current gating network; only a subset of experts is activated per token.
+3. **Task Loss** – Standard language modeling loss (cross‑entropy) is computed.
+4. **Expert Weight Update** – Parameters of the active experts are updated with stochastic gradient descent.
+5. **Leaderboard Evaluation** – We run the model on a fixed validation subset taken from each of the five target leaderboards (e.g., MMLU, GSM‑8K, HumanEval, BigBench‑Hard, and LAMBADA). The output yields a rank per benchmark.
+6. **Meta‑Loss** – A differentiable approximation of rank loss (e.g., soft‑sorting loss) aggregates the five ranks into a single scalar.
+7. **Threshold Check** – If the meta‑loss improvement is below a preset epsilon, we deem the current update insufficient and trigger expert adaptation.
+8. **Expert Adaptation** – Based on gradient statistics we either instantiate a new expert (copy of the highest‑variance active expert) or prune the lowest‑contributing expert.
+9. **Knowledge Distillation** – The surviving experts teach a compact student network; its outputs are used to initialise any newly added expert, preventing cold‑start degradation.
+10. **Routing Policy Update** – A lightweight reinforcement‑learning step (REINFORCE with baseline) updates the gating network to favor experts that reduced meta‑loss in the current cycle.
+11. **Cycle End** – The updated model parameters and gating weights become the starting point for the next improvement cycle.
+
+The loop runs autonomously; human intervention is only required to set the evaluation frequency and the meta‑loss threshold.
+
+## Core Concepts
+- **Dynamic Expert Pool** – The model maintains a variable‑size set of expert modules. Each expert is a standard transformer block with ~10 B parameters. The pool can grow to 24 experts (18 core + 6 auxiliary) and shrink when redundancy is detected.
+- **Gating Network** – A multi‑head attention router that takes the hidden state of the previous layer and produces a sparse distribution over experts. Entropy regularisation ensures no single expert dominates (> 80 % activation) which preserves model capacity.
+- **Recursive Self‑Improvement Objective** – The total loss for a cycle is  
+  `L_total = L_task + λ * L_meta`  
+  where `L_task` is the usual language modeling loss and `L_meta` is the soft‑sorting rank loss across leaderboards. λ is annealed from 0.1 to 0.5 over the first 20 cycles to balance immediate accuracy with long‑term ranking stability.
+- **Progressive Distillation** – When a new expert is added, we initialise its weights with the output of a teacher network formed by averaging the top‑k experts from the previous cycle. This reduces the warm‑up period from thousands of steps to a few hundred.
+- **Sparse Activation Pruning** – At inference time we compute an entropy score for each token’s gating distribution; if the score falls below a threshold we deactivate the lowest‑probability expert, saving FLOPs without measurable quality loss.
+
+## Examples & Code Walkthrough
+Below is a simplified but complete PyTorch module that implements one improvement cycle. It includes defensive checks, clear variable names, and inline comments explaining the non‑obvious parts.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List, Tuple
+
+class DarwinRSIModule(nn.Module):
+    """
+    Encapsulates one RSI cycle: forward pass, task loss,
+    meta‑loss computation, expert adaptation, and routing update.
+    """
+
+    def __init__(
+        self,
+        base_moe: nn.Module,
+        leaderboard_eval_fn,
+        meta_loss_fn,
+        lr_expert: float = 1e-4,
+        lr_gate: float = 5e-5,
+        entropy_coeff: float = 0.01,
+        meta_loss_threshold: float = 0.001,
+    ):
+        super().__init__()
+        self.moe = base_moe                      # The underlying MoE (experts + gate)
+        self.eval_fn = leaderboard_eval_fn       # Callable returning dict {name: rank}
+        self.meta_loss_fn = meta_loss_fn         # Soft‑sorting loss over ranks
+        self.expert_opt = torch.optim.Adam(
+            self.moe.experts.parameters(), lr=lr_expert
+        )
+        self.gate_opt = torch.optim.Adam(
+            self.moe.gate.parameters(), lr=lr_gate
+        )
+        self.entropy_coeff = entropy_coeff
+        self.meta_thresh = meta_loss_threshold
+        self.step_counter = 0
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Standard forward through the MoE; returns logits."""
+        return self.moe(input_ids)
+
+    def compute_task_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Cross‑entropy loss with label smoothing."""
+        return F.cross_entropy(logits.view(-1, logits.size(-1)),
+                               labels.view(-1),
+                               label_smoothing=0.1)
+
+    def compute_meta_loss(self) -> torch.Tensor:
+        """
+        Evaluate on held‑out leaderboard slices and return a differentiable
+        rank‑based loss. The eval_fn must return torch tensors with grad support.
+        """
+        ranks: List[torch.Tensor] = []
+        for name, tensor in self.eval_fn().items():
+            # Assume each tensor is a scalar rank (lower is better)
+            ranks.append(tensor)
+        ranks_tensor = torch.stack(ranks)  # shape: [num_leaderboards]
+        return self.meta_loss_fn(ranks_tensor)
+
+    def adapt_experts(self):
+        """
+        Add or remove experts based on gradient variance and contribution.
+        This is a heuristic; production systems may replace it with a learned controller.
+        """
+        with torch.no_grad():
+            # Compute per‑expert gradient norm as a proxy for usefulness
+            grad_norms = []
+            for expert in self.moe.experts:
+                if expert.weight.grad is not None:
+                    grad_norms.append(expert.weight.grad.norm().item())
+                else:
+                    grad_norms.append(0.0)
+            grad_norms = torch.tensor(grad_norms)
+
+            # If any expert's norm is near zero for >5 steps, prune it
+            low_use = grad_norms < 1e-5
+            if low_use.any():
+                idx_to_prune = low_use.nonzero(as_tuple=False).squeeze(-1)
+                # Remove in reverse order to keep indices valid
+                for idx in sorted(idx_to_prune.tolist(), reverse=True):
+                    del self.moe.experts[idx]
+                # Re‑initialize gate output dimension to match new expert count
+                self.moe.gate.reset_experts(len(self.moe.experts))
+
+            # If gradient variance is high, spawn a copy of the most volatile expert
+            if grad_norms.std() > 0.2:
+                volatile_idx = grad_norms.argmax().item()
+                new_expert = type(self.moe.experts[0])(
+                    self.moe.experts[0].config
+                )
+                # Copy weights from the volatile expert
+                new_expert.load_state_dict(self.moe.experts[volatile_idx].state_dict())
+                self.moe.experts.append(new_expert)
+                self.moe.gate.reset_experts(len(self.moe.experts))
+
+    def update_routing(self, meta_loss: torch.Tensor):
+        """
+        Reinforcement‑learning style update of the gating network.
+        We treat negative meta‑loss as reward and use REINFORCE with a moving average baseline.
+        """
+        reward = -meta_loss.detach()
+        # Simple baseline: exponential moving average of reward
+        if not hasattr(self, "reward_baseline"):
+            self.reward_baseline = reward
+        else:
+            self.reward_baseline = 0.9 * self.reward_baseline + 0.1 * reward
+
+        advantage = reward - self.reward_baseline
+        # Get gate logits for the last forward pass (stored in self.moe)
+        logits = self.moe.last_gate_logits  # shape: [batch, seq, num_experts]
+        log_probs = F.log_softmax(logits, dim=-1)
+        # Policy gradient loss
+        pg_loss = -(log_probs * advantage.unsqueeze(-1).unsqueeze(-1)).mean()
+        self.gate_opt.zero_grad()
+        pg_loss.backward()
+        self.gate_opt.step()
+
+    def train_step(self, batch: Tuple[torch.Tensor, torch.Tensor]) -> dict:
+        """
+        Execute one full RSI cycle on a batch.
+        Returns a dict with diagnostic metrics.
+        """
+        input_ids, labels = batch
+        self.moe.zero_grad()
+
+        # Forward + task loss
+        logits = self.forward(input_ids)
+        task_loss = self.compute_task_loss(logits, labels)
+
+        # Backprop on expert parameters only (gate

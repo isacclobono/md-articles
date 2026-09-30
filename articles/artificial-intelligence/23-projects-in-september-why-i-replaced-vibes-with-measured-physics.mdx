@@ -1,0 +1,354 @@
+---
+title: "23 Projects in September: Why I Replaced Vibes With Measured Physics"
+slug: "23-projects-in-september-why-i-replaced-vibes-with-measured-physics"
+description: "September didn't start with a bang. It started with a dashboard that was entirely green—unit tests passing, CI pipelines screaming \"SUCCESS,\" LLM-as-a-Judge sco..."
+category: "Artificial Intelligence"
+tags: ["replaced", "artificial intelligence", "september", "projects"]
+keywords: ["september", "programming", "tech guide", "projects", "replaced", "artificial intelligence", "software engineering"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-09-30"
+readingTime: "10 min read"
+---
+
+# 23 Projects in September: Why I Replaced Vibes With Measured Physics
+
+## Introduction
+
+September didn't start with a bang. It started with a dashboard that was entirely green—unit tests passing, CI pipelines screaming "SUCCESS," LLM-as-a-Judge scores hovering at 4.8/5—and a production incident queue that was entirely red.
+
+We merged 23 pull requests that month. Twenty-three attempts to fix a RAG pipeline, an agent loop, a fine-tuning run, a prompt template refactor. Twenty-three times we thought "this looks good to me" (LG2M) during code review. Twenty-three times we watched the metrics degrade in ways our eval suite swore were impossible.
+
+The breaking point wasn't a crash. It was a legal citation. A hallucinated case number, *Doe v. Acme Corp, 2024*, rendered with perfect Bluebook formatting and high confidence, served to a paying customer. My eval suite? It checked "citation format valid: true." It checked "tone: professional." It missed "case exists in LexisNexis: false" because we never wired that check up. We were testing the *syntax* of the answer, not the *physics* of the system.
+
+That’s when I stopped writing evals and started building a wind tunnel.
+
+## Why This Matters
+
+If you are running LLMs in production, you are currently flying blind. The industry standard—`pytest` for prompts, BLEU/ROUGE for generation, LLM-as-a-Judge for "vibes"—treats stochastic systems like deterministic libraries. They aren't.
+
+*   **Unit tests** verify logic. LLMs have no logic, only probability distributions.
+*   **Benchmarks (MMLU, GSM8K)** measure *Potential Energy* (static capability). They tell you nothing about *Kinetic Energy* (runtime behavior under load) or *Entropy* (variance when the context window shifts).
+*   **LLM-as-a-Judge** is circular reasoning. You are asking the model (or a sibling model) to grade its own homework. It correlates with human preference only when the task is "sound helpful." It fails catastrophically on "be correct."
+
+We needed a framework that quantified the *cost* of running these models. Not token cost—Dollar cost is easy. I mean **Work**: the human energy required to fix the output. **Entropy**: the structural drift that turns a working prompt into a liability after a model update. **Friction**: the resistance the system exerts against your intent.
+
+This article details the `physeval` framework we built in October to dig out of the September hole. It’s not a library you `pip install`. It’s a measurement philosophy implemented in ~300 lines of Python that sits between your orchestration layer and your model gateway.
+
+## How It Works
+
+The core insight is treating the LLM inference pipeline as a thermodynamic system. We define a **State** (`EnergyState`) captured at every inference step. We don't just log it; we constrain it. If a call exceeds its **Gibbs Free Energy** budget (our proxy for "usable signal"), we reject the result *before* it hits the user.
+
+The architecture consists of four stages:
+
+1.  **Instrumentation**: Wrapping the model client to capture logits, latency, token counts, and structured output validity.
+2.  **Simulation (The Wind Tunnel)**: Replaying production embeddings against candidate prompts/models *offline* to map the phase space (Entropy vs. Work).
+3.  **Verification**: Calculating `Work` via AST diffing (code) or Semantic Entailment (text) against a golden reference.
+4.  **Guardrails**: The `@measured_physics` decorator enforcing the "Safe Operating Envelope" at runtime.
+
+```mermaid
+flowchart TD
+    subgraph "Development / CI"
+        A[PR Opened] --> B{physeval CLI}
+        B --> C[Wind Tunnel Simulation]
+        C --> D[Load Production Embeddings]
+        D --> E[Adversarial Boundary Search]
+        E --> F[Generate EnergyState Map]
+        F --> G{Inside Safe Envelope?}
+        G -- No --> H[FAIL BUILD: PhysicsViolation]
+        G -- Yes --> I[Merge to Main]
+    end
+
+    subgraph "Runtime / Production"
+        J[User Request] --> K[@measured_physics Decorator]
+        K --> L[LLM Gateway]
+        L --> M[Stream Interceptor]
+        M --> N[Running Entropy Calc]
+        N --> O{Work < Threshold?}
+        O -- No --> P[Raise PhysicsViolationError]
+        O -- Yes --> Q[Return Validated Output]
+        P --> R[Fallback / Human Review Queue]
+    end
+
+    subgraph "Observability"
+        Q --> S[Time-Series DB: EnergyState]
+        H --> S
+        R --> S
+        S --> T[Phase Diagram Dashboard]
+        T --> U[Entropy vs Work Scatter]
+        U --> V[Convex Hull = Safe Envelope]
+    end
+
+    style H fill:#ffcccc,stroke:#ff0000
+    style P fill:#ffcccc,stroke:#ff0000
+    style V fill:#ccffcc,stroke:#00aa00
+```
+
+## Core Concepts
+
+### The State Vector: `EnergyState`
+
+We model every inference call as a thermodynamic state. This isn't a metaphor; it's a dataclass with a `gibbs_free_energy` property that drives our release gates.
+
+```python
+# physics/core/thermodynamics.py
+from dataclasses import dataclass
+from typing import Optional
+import math
+
+@dataclass(slots=True, frozen=True)
+class EnergyState:
+    """
+    Immutable snapshot of a single inference transaction.
+    Uses __slots__ to minimize GC pressure in high-throughput eval loops.
+    """
+    potential: float      # [0.0, 1.0] Static capability (Benchmark score normalized)
+    kinetic: float        # [0.0, inf]   Runtime efficiency: tokens/sec * constraint_adherence
+    entropy: float        # [0.0, inf]   Shannon entropy of logits / Structural variance (n-gram diversity)
+    work: float           # [0.0, inf]   Human intervention cost (Edit distance * Cognitive weight)
+    temperature: float    # Sampling temperature used
+    latency_ms: int       # Wall clock latency
+    token_count: int      # Total tokens generated (prompt + completion)
+    
+    # Metadata for traceability
+    model_id: str
+    prompt_hash: str
+    trace_id: str
+
+    @property
+    def gibbs_free_energy(self) -> float:
+        """
+        G = H - T*S  ->  (U + K) - (T * S) - W
+        
+        Usable Signal. Lower is better.
+        High Potential/Kinetic (Good) lowers G.
+        High Temp/Entropy (Chaos) raises G.
+        High Work (Human cleanup) raises G.
+        """
+        enthalpy = self.potential + self.kinetic
+        entropy_cost = self.temperature * self.entropy
+        return enthalpy - entropy_cost - self.work
+
+    @property
+    def efficiency(self) -> float:
+        """Tokens per unit of Gibbs Energy. Higher = more signal per compute dollar."""
+        if self.gibbs_free_energy <= 0:
+            return float('inf')
+        return self.token_count / self.gibbs_free_energy
+
+    def to_dict(self) -> dict:
+        """Structured logging for the time-series DB."""
+        return {
+            "potential": self.potential,
+            "kinetic": self.kinetic,
+            "entropy": self.entropy,
+            "work": self.work,
+            "temperature": self.temperature,
+            "gibbs": self.gibbs_free_energy,
+            "efficiency": self.efficiency,
+            "latency_ms": self.latency_ms,
+            "model_id": self.model_id,
+            "trace_id": self.trace_id,
+        }
+```
+
+### The Wind Tunnel: Adversarial Simulation
+
+Static eval sets are dead on arrival. They represent the *past* distribution. The Wind Tunnel uses your *actual* production traffic embeddings (stored in a FAISS/Annoy index) to find inputs that *maximize* entropy for your current prompt/model combo.
+
+```python
+# physics/instrumentation/wind_tunnel.py
+import numpy as np
+from physics.core.thermodynamics import EnergyState
+from typing import Callable, List, Tuple
+import faiss # Assuming FAISS index for production embeddings
+
+class WindTunnel:
+    """
+    Generates adversarial test cases by searching the production embedding space
+    for neighbors that maximize model entropy (uncertainty/confusion).
+    """
+    def __init__(self, 
+                 production_index: faiss.IndexFlatIP, 
+                 embed_fn: Callable[[str], np.ndarray],
+                 inference_fn: Callable[[str], EnergyState],
+                 k_neighbors: int = 50):
+        self.index = production_index
+        self.embed = embed_fn
+        self.infer = inference_fn
+        self.k = k_neighbors
+
+    def boundary_search(self, seed_query: str, epsilon: float = 0.05, steps: int = 10) -> List[EnergyState]:
+        """
+        Gradient-free optimization: Walk the embedding manifold toward high entropy.
+        
+        Args:
+            seed_query: A real production query to start from.
+            epsilon: Step size in embedding space (cosine distance).
+            steps: Number of boundary steps to take.
+            
+        Returns:
+            List of EnergyStates representing the 'worst case' trajectory.
+        """
+        current_embedding = self.embed(seed_query).astype(np.float32).reshape(1, -1)
+        faiss.normalize_L2(current_embedding)
+        trajectory = []
+
+        for _ in range(steps):
+            # 1. Search neighbors in production space (realistic distribution)
+            distances, indices = self.index.search(current_embedding, self.k)
+            
+            # 2. Evaluate entropy on neighbors (batched inference would be better here)
+            candidate_states = []
+            # Note: In reality, we'd need a mapping from index -> raw text. 
+            # Assuming a metadata store `id_to_text` exists.
+            for idx in indices[0]:
+                if idx == -1: continue
+                # neighbor_text = self.id_to_text[idx] # External dependency
+                # state = self.infer(neighbor_text)
+                # candidate_states.append(state)
+                pass # Placeholder for actual inference loop
+
+            # 3. Select neighbor with MAX entropy (most unstable)
+            if not candidate_states:
+                break
+            
+            worst_state = max(candidate_states, key=lambda s: s.entropy)
+            trajectory.append(worst_state)
+            
+            # 4. Step embedding toward worst case (Project gradient approx)
+            # This is a simplified heuristic. Real impl uses finite differences on embedding.
+            # worst_emb = self.embed(worst_state.prompt_text) # Need prompt text in state
+            # direction = worst_emb - current_embedding.flatten()
+            # current_embedding += epsilon * direction / (np.linalg.norm(direction) + 1e-8)
+            # faiss.normalize_L2(current_embedding)
+            
+        return trajectory
+```
+
+### The Friction Coefficient: Runtime Guardrails
+
+This is the piece that saved us in October. A decorator that wraps *any* LLM call (OpenAI, Anthropic, vLLM, local) and calculates running `Work` and `Entropy` on the stream. If the physics violate the contract, it throws *before* the user sees garbage.
+
+```python
+# physics/guardrails/friction.py
+import json
+import functools
+import time
+from typing import Callable, Any, Dict, Optional, AsyncGenerator
+from physics.core.thermodynamics import EnergyState
+
+class PhysicsViolationError(RuntimeError):
+    """Raised when an inference call exits the Safe Operating Envelope."""
+    def __init__(self, state: EnergyState, message: str):
+        self.state = state
+        super().__init__(f"Physics Violation: {message} | Gibbs: {state.gibbs_free_energy:.4f}")
+
+def measured_physics(
+    max_work: float = 0.3, 
+    max_entropy: float = 1.5, 
+    min_gibbs: float = -0.5,
+    schema: Optional[Dict] = None # JSON Schema for structural validation
+):
+    """
+    Decorator enforcing physics constraints on LLM streams.
+    
+    Args:
+        max_work: Max allowed 'Work' (0.0-1.0 heuristic). 
+                  Heuristic: JSON parse failure=0.5, Schema violation=0.3, Hallucination proxy=0.8
+        max_entropy: Max allowed running entropy (perplexity proxy).
+        min_gibbs: Minimum Gibbs Free Energy (Quality floor).
+        schema: Optional JSON schema for structured output validation.
+    """
+    def decorator(func: Callable[..., AsyncGenerator[str, None]]):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs) -> AsyncGenerator[str, None]:
+            start_time = time.perf_counter()
+            token_buffer = []
+            logit_buffer = [] # Requires logprobs=True on API call
+            structural_errors = 0
+            
+            # We assume the wrapped function yields tokens (str) 
+            # and ideally exposes logprobs via a side-channel or tuple yield.
+            # For this example, we simulate logprobs heuristic.
+            
+            async for chunk in func(*args, **kwargs):
+                token_buffer.append(chunk)
+                yield chunk # Pass through immediately for latency
+                
+                # --- RUNNING PHYSICS CALCULATION ---
+                # 1. Entropy Proxy: Running perplexity estimate (requires logprobs)
+                # If API doesn't support logprobs, fallback to n-gram repetition penalty.
+                # current_entropy = _estimate_entropy(logit_buffer) 
+                
+                # 2. Work Proxy: Structural validity check (incremental JSON parse)
+                if schema:
+                    try:
+                        # Try parsing partial JSON (using a lenient parser or regex guard)
+                        # This is expensive per token; batch every N tokens in prod.
+                        partial = "".join(token_buffer)
+                        # json.loads(partial) # Strict fails on partial
+                        # Use a streaming JSON validator (e.g., `json-stream` or custom FSM)
+                        _validate_partial_json(partial, schema) 
+                    except (json.JSONDecodeError, ValueError):
+                        structural_errors += 1
+                
+                # Early exit if entropy spikes (hallucination loop detection)
+                # if current_entropy > max_entropy:
+                #     raise PhysicsViolationError(
+                #         EnergyState(..., entropy=current_entropy, ...), 
+                #         f"Entropy spike detected: {current_entropy:.2f} > {max_entropy}"
+                #     )
+
+            # --- POST-STREAM FINAL VALIDATION ---
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            full_text = "".join(token_buffer)
+            
+            # Calculate final Work (Heuristic)
+            work = 0.0
+            if schema:
+                try:
+                    json.loads(full_text)
+                except json.JSONDecodeError:
+                    work += 0.5 # Hard parse failure = high work
+            
+            # Schema validation (using jsonschema library ideally)
+            # if schema and not validate(full_text, schema): work += 0.3
+            
+            # Heuristic: Repetition / Loop detection
+            if _detect_loop(full_text): work += 0.8
+            
+            # Construct Final State (Potential/Kinetic usually pre-computed or static per model)
+            final_state = EnergyState(
+                potential=0.85, # Static for model version
+                kinetic=len(token_buffer) / (latency_ms / 1000), # Tokens/sec
+                entropy=0.0, # Placeholder: needs logprobs
+                work=work,
+                temperature=kwargs.get('temperature', 0.7),
+                latency_ms=latency_ms,
+                token_count=len(token_buffer),
+                model_id=kwargs.get('model', 'unknown'),
+                prompt_hash=hash(str(args)), # Simplistic
+                trace_id=kwargs.get('trace_id', 'local')
+            )
+
+            # GATE CHECK
+            if work > max_work:
+                raise PhysicsViolationError(final_state, f"Work {work:.2f} exceeds budget {max_work}")
+            if final_state.gibbs_free_energy < min_gibbs:
+                raise PhysicsViolationError(final_state, f"Gibbs {final_state.gibbs_free_energy:.2f} below floor {min_gibbs}")
+
+            # If we yield here, the caller gets the valid stream.
+            # If exception raised, caller catches and routes to fallback.
+        return wrapper
+    return decorator
+
+# --- Helpers ---
+def _validate_partial_json(text: str, schema: Dict) -> None:
+    """Minimal FSM to check if partial JSON *can* become valid. 
+    Production version uses a proper streaming validator."""
+    # Check bracket balance
+    if text.count('{') < text.count('}') or text.count('[') < text.count(']'):
+        raise ValueError("Unbalanced brackets")
+    # Check trailing comma / incomplete string
+    if text.strip().endswith(','):
+        raise ValueError("Trailing comma

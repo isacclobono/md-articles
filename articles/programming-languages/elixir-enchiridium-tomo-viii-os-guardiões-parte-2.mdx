@@ -1,0 +1,240 @@
+---
+title: "Elixir Enchiridium — Tomo VIII: Os Guardiões parte 2"
+slug: "elixir-enchiridium-tomo-viii-os-guardiões-parte-2"
+description: "Em nossos sistemas de alta disponibilidade, o maior desafio costuma ser garantir que processos críticos sejam reiniciados de forma previsível quando algo dá err..."
+category: "Programming Languages"
+tags: ["programming languages", "enchiridium", "elixir", "tomo"]
+keywords: ["tomo", "elixir", "enchiridium", "programming languages", "programming", "tech guide", "software engineering"]
+author: "Compiler & Language Architect"
+publishedAt: "2026-10-03"
+readingTime: "8 min read"
+---
+
+# Elixir Enchiridium — Tomo VIII: Os Guardiões parte 2
+
+## Introduction
+Em nossos sistemas de alta disponibilidade, o maior desafio costuma ser garantir que processos críticos sejam reiniciados de forma previsível quando algo dá errado. Na série *Os Guardiões* já vimos como os supervisors básicos criam uma hierarquia estática de filhos. Nesta parte vamos aprofundar o conceito de **supervisores dinâmicos** – aqueles que podem criar e terminar filhos em tempo de execução, respondendo a cargas de trabalho que variam ao longo do dia.
+
+## Why This Matters
+Imagine um serviço de notificação que precisa escalar o número de workers conforme o volume de mensagens entrantes. Se cada pico de tráfego for atendido apenas por processos pré‑alocados, você acaba desperdiçando recursos em momentos ociosos ou, pior, perdendo mensagens quando a demanda supera a capacidade estática. Supervisores dinâmicos resolvem isso ao permitir que o sistema nasça com um número mínimo de workers e aumente ou diminua conforme a fila de trabalho cresce ou encolhe. Isso reduz custos de infraestrutura, melhora a latência sob carga e evita falhas em cascata quando um worker trava.
+
+## How It Works
+Um supervisor dinâmico é um processo que implementa o comportamento `DynamicSupervisor`. Ele não tem uma lista fixa de filhos no seu `init/1`. Em vez disso, expõe a função `start_child/2` que pode ser chamada a qualquer momento para lançar um novo worker sob sua supervisão. Cada filho registrado ganha um identificador interno que pode ser usado para encerrá-lo posteriormente (`terminate_child/2`) ou consultar seu estado.
+
+Abaixo, um diagrama que ilustra o fluxo típico: uma aplicação inicia o `DynamicSupervisor`, um produtor coloca trabalhos em uma fila (por exemplo, usando `Broadway` ou uma simples fila de `GenServer`), e um consumidor solicita ao supervisor um novo worker sempre que a fila ultrapassa um limiar. Quando o trabalho termina, o worker se encerra e o supervisor o remove automaticamente.
+
+```mermaid
+flowchart TD
+    A[Application start] --> B[Start DynamicSupervisor]
+    B --> C[Worker Pool (empty)]
+    C --> D[Producer enqueues jobs]
+    D --> E{Queue length > threshold?}
+    E -- Yes --> F[Consumer calls start_child]
+    F --> G[DynamicSupervisor spawns Worker]
+    G --> H[Worker processes job]
+    H --> I[Job done?]
+    I -- Yes --> J[Worker exits normally]
+    I -- No --> K[Worker crashes]
+    K --> L[Supervisor restarts worker per strategy]
+    J --> M[Supervisor removes child]
+    M --> C
+    E -- No --> C
+```
+
+### Passo a passo
+1. **Inicialização** – O módulo de aplicação chama `DynamicSupervisor.start_link/2` com uma estratégia (geralmente `:one_for_one`) e um nome opcional.
+2. **Produção** – Um processo separado (pode ser uma `GenServer` ou uma tarefa periódica) coloca mensagens em uma fila estruturada (por exemplo, uma lista protegida por `Mutex` ou uma fila persistente como `RabbitMQ`).
+3. **Consumo** – Um consumidor monitora o tamanho da fila. Sempre que ele ultrapassa um limite configurado, ele invoca `DynamicSupervisor.start_child/2, [MyWorker, []]`.
+4. **Execução do worker** – O worker, implementado como `GenServer`, recebe o trabalho via `call` ou `cast`, processa e, ao terminar, retorna `{:stop, :normal, state}` ou simplesmente encerra após um `timeout`.
+5. **Limpeza** – Se o worker encerrar normalmente, o supervisor o remove da sua lista interna. Se ele cair, a estratégia de reinicialização (`:one_for_one` com `:restart :transient` ou `:temporary`) decide se um novo será criado.
+
+## Core Concepts
+- **DynamicSupervisor**: comportamento OTP que não pré‑aloca filhos. Fornece `start_child/2`, `terminate_child/2`, `which_children/0`.
+- **Child spec**: mapa que descreve como iniciar um filho (`id`, `start`, `restart`, `shutdown`, `type`, `modules`). No caso dinâmico, o `id` pode ser gerado em tempo de execução (por exemplo, usando `:erlang.make_ref/0`).
+- **Supervision strategy**: `:one_for_one` é o padrão mais usado; cada filho falha isoladamente. `:one_for_all` e `:rest_for_one` existem raramente em cenários dinâmicos.
+- **Nomeação de filhos**: embora os dinâmicos não sejam registrados automaticamente no `:registry`, podemos associar um nome simbólico ao `id` do child spec para facilitar depuração.
+- **Sobrecarga**: iniciar um novo processo custa cerca de 2‑3 microssegundos em máquinas modernas; a maior parte do overhead vem do agendador e da cópia do estado inicial.
+
+## Examples & Code Walkthrough
+Vamos construir um pequeno serviço que processa imagens redimensionando‑as. O trabalho chega como um mapa contendo o caminho do arquivo de entrada e o caminho de saída. Cada worker é um `GenServer` que recebe o trabalho, chama uma biblioteca externa (simulada aqui por um `sleep`) e então se encerra.
+
+```elixir
+defmodule ImageWorker do
+  @moduledoc """
+  Um GenServer simples que executa o redimensionamento de uma imagem.
+  Ele espera receber um mapa com :input_path e :output_path.
+  """
+  use GenServer
+
+  # API pública ---------------------------------------------------------
+  def start_link(_init_arg) do
+    GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  end
+
+  def process_job(job) do
+    GenServer.call(__MODULE__, {:process, job}, timeout: 60_000)
+  end
+
+  # GenServer callbacks -------------------------------------------------
+  @impl true
+  def init(:ok) do
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_call({:process, %{
+        input_path: input,
+        output_path: output
+      }}, _from, state) do
+    # Simulamos trabalho pesado; em produção seria uma chamada a ImageMagick ou libvips
+    case System.cmd("convert", ["-resize", "300x300", input, output]) do
+      {_, 0} ->
+        {:reply, :ok, state}
+      {_, exit_code} ->
+        {:reply, {:error, "Conversion failed with exit #{exit_code}"}, state}
+    end
+  end
+
+  # Caso o GenServer receba uma chamada inesperada, apenas retornamos o estado
+  @impl true
+  def handle_info(_msg, state) do
+    {:noreply, state}
+  end
+end
+```
+
+Agora o supervisor dinâmico que irá gerar esses workers sempre que houver trabalho pendente:
+
+```elixir
+defmodule ImageSupervisor do
+  @moduledoc """
+  Supervisor dinâmico responsável por criar e monitorar ImageWorker.
+  """
+  use DynamicSupervisor
+
+  # Inicia o supervisor com nome global para facilitar a chamada de outras partes
+  def start_link() do
+    DynamicSupervisor.start_link(__MODULE__, :ok, name: ImageSupervisor)
+  end
+
+  @impl true
+  def init(:ok) do
+    # Estratégia :one_for_one com restart :temporary – workers que terminam
+    # normalmente não são reiniciados; apenas os que caem são.
+    DynamicSupervisor.init(strategy: :one_for_one, extra_arguments: [:temporary])
+  end
+
+  # Função de conveniência para lançar um novo worker
+  def start_worker() do
+    DynamicSupervisor.start_child(ImageSupervisor, {ImageWorker, []})
+  end
+
+  # Opcional: encerrar um worker específico pelo seu ID retornado por start_child/2
+  def stop_worker(child_id) do
+    DynamicSupervisor.terminate_child(ImageSupervisor, child_id)
+  end
+end
+```
+
+Um consumidor simples que observa uma fila (aqui simulada por um `Agent` contendo uma lista) e dispara workers quando necessário:
+
+```elixir
+defmodule JobQueue do
+  @moduledoc """
+  Fila em memória para demonstração. Em produção usaríamos algo como
+  Broadway, RabbitMQ ou um banco de dados persistente.
+  """
+  use Agent
+
+  def start_link() do
+    Agent.start_link(fn -> [] end, name: JobQueue)
+  end
+
+  def enqueue(job) do
+    Agent.update(JobQueue, &([job | &1]))
+  end
+
+  def dequeue() do
+    Agent.get_and_update(JobQueue, fn
+      [] -> {:nil, []}
+      [h | t] -> {h, t}
+    end)
+  end
+
+  def length() do
+    Agent.get(JobQueue, &length/1)
+  end
+end
+
+defmodule ImageProcessor do
+  @moduledoc """
+  Processo que consome a fila e escala o número de workers dinamicamente.
+  """
+  def start_link() do
+    Task.start_link(__MODULE__, :run, [])
+  end
+
+  def run() do
+    # Garante que as dependências estejam ativas
+    {:ok, _} = JobQueue.start_link()
+    {:ok, _} = ImageSupervisor.start_link()
+
+    loop()
+  end
+
+  defp loop() do
+    case JobQueue.length() do
+      n when n >= 10 ->
+        # Se houver mais de 10 jobs pendentes, garantimos pelo menos 5 workers ativos
+        ensure_workers(5)
+      n when n > 0 ->
+        # Para filas menores, mantemos apenas um worker ativo
+        ensure_workers(1)
+      _ ->
+        :ok
+    end
+
+    # Processa um job se houver algum worker livre (simplificado)
+    case JobQueue.dequeue() do
+      {:nil, _} ->
+        :ok # nada a fazer
+      {job, _remaining} ->
+        # Dispara o trabalho em um processo separado para não bloquear o loop
+        Task.start_link(fn ->
+          ImageSupervisor.start_worker()
+          |> case do
+            {:ok, pid} ->
+              ImageWorker.process_job(job)
+              # Após o término, o worker se encerra sozinho (retorna :normal)
+              ImageSupervisor.stop_worker(pid)
+            {:error, _reason} ->
+              # Log ou métrica de falha ao iniciar worker
+              :error
+          end
+        end)
+    end
+
+    Process.sleep(500) # pequeno intervalo para não consumir CPU excessivamente
+    loop()
+  end
+
+  defp ensure_workers(min) do
+    current = DynamicSupervisor.which_children(ImageSupervisor) |> length()
+    when current < min do
+      # Cria workers faltantes
+      for _ <- 1..(min - current), do: ImageSupervisor.start_worker()
+    end
+  end
+}
+```
+
+**Pontos de atenção no código acima**:
+- O worker retorna `:normal` após concluir o trabalho, fazendo com que o supervisor o remova automaticamente (já que usamos `:temporary` como estratégia de reinicialização).
+- O consumidor verifica o tamanho da fila a cada 500 ms e ajusta o número de workers ativos. Essa granularidade pode ser ajustada conforme a latência aceitável.
+- Usamos `Task.start_link` para não bloquear o loop do consumidor ao disparar um novo worker.
+- Todo acesso à fila é feito através de um `Agent`, que oferece consistência simples para esse exemplo. Em produção, troque por uma fila verdadeiramente concorrente e persistente.
+
+## Best Practices
+1. **Defina claramente a estratégia de reinicialização** – Para workers que concluem seu trabalho com sucesso, use `:temporary` ou `:transient`. Dessa forma, você evita reinicializações desnecessárias que consomem CPU.
+2. **Limite a taxa de criação de filhos** – Um pico repentino pode disparar a criação de milhares de processos em poucos milissegundos, sobrecarregando o agendador. Considere usar um `Token Bucket` ou um `GenServer` que throttling chamadas a `start_child/2`.
+3. **Monitore o número de filhos ativos** – Métricas como `DynamicSupervisor.which_children/

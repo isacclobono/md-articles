@@ -1,0 +1,287 @@
+---
+title: "Um dia sem Visual Studio usando só a .NET CLI"
+slug: "um-dia-sem-visual-studio-usando-só-a-net-cli"
+description: "Um dia inteiro de desenvolvimento usando apenas a linha de comando do .NET pode parecer um passo atrás para quem está acostumado com o Visual Studio, mas na prá..."
+category: "Cloud Computing"
+tags: ["studio", "cloud computing", "visual", "usando"]
+keywords: ["visual", "studio", "cloud computing", "tech guide", "software engineering", "programming", "usando"]
+author: "Principal Cloud Architect"
+publishedAt: "2026-10-03"
+readingTime: "7 min read"
+---
+
+# Um dia sem Visual Studio usando só a .NET CLI
+
+## Introduction
+Um dia inteiro de desenvolvimento usando apenas a linha de comando do .NET pode parecer um passo atrás para quem está acostumado com o Visual Studio, mas na prática revela ganhos de produtividade, reproducibilidade e integração direta com pipelines de CI/CD. Neste artigo vamos mostrar como criar, testar, publicar e implantar um microserviço ASP.NET Core mínimo sem abrir nenhum IDE, focando apenas nas ferramentas que vem com o SDK.
+
+## Why This Matters
+Equipes que adotam pipelines baseados em containers e infraestrutura como código precisam de builds que sejam totalmente determinísticos e que possam ser executados em qualquer agente, seja ele uma máquina local ou um runner de CI. Quando o processo de compilação depende apenas do `dotnet` CLI, eliminamos variações causadas por extensões de IDE, versões de plugins ou configurações de usuário. Isso reduz o “works on my machine” e acelera o onboarding de novos engenheiros, além de permitir que a mesma sequência de comandos rode em um laptop Windows, uma máquina Linux ou um macOS sem ajustes.
+
+## How It Works
+O fluxo típico de desenvolvimento com .NET CLI segue estas etapas:
+
+1. **Restore** – baixa os pacotes NuGet declarados no arquivo `.csproj`.
+2. **Build** – compila o código usando MSBuild, gerando assemblies intermediários.
+3. **Test** – executa os projetos de teste (xUnit, NUnit, MSTest) e produz um relatório.
+4. **Publish** – produz os artefatos prontos para implantação (self‑contained ou framework‑dependent).
+5. **Deploy** – move o artefato para um ambiente de execução (Docker, Azure App Service, Kubernetes, etc.).
+
+Abaixo está um diagrama que ilustra essa sequência:
+
+```mermaid
+flowchart TD
+    A[Código Fonte] --> B[dotnet restore]
+    B --> C[dotnet build]
+    C --> D[dotnet test]
+    D --> E[dotnet publish]
+    E --> F[Artefato Publicado]
+    F --> G[Implantação (Docker/K8s)]
+```
+
+Cada etapa pode ser encadeada em um script de build ou acionada manualmente conforme a necessidade. O CLI também oferece comandos de observabilidade como `dotnet watch` para recarregar o aplicação ao detectar mudanças nos fontes.
+
+## Core Concepts
+- **SDK vs Runtime** – O SDK contém as ferramentas de build (`dotnet build`, `dotnet publish`) e os templates. O runtime apenas executa o código já compilado.
+- **Arquivo de projeto (.csproj)** – Define dependências, versão do SDK, propriedades de build e condições de publicação. É a fonte de verdade para o MSBuild.
+- **Self‑contained vs Framework‑dependent** – Um publish self‑contained inclui o runtime, resultando em um pacote maior mas independente da máquina alvo. Um publish framework‑dependent depende da presença do runtime no host, gerando artefatos menores.
+- **Trimming (ILLinker)** – Durante o publish, o vinculador pode remover código IL não usado, reduzindo o tamanho do binário. É essencial testar porque reflexão ou serialization dinâmica podem quebrar se não configurados corretamente.
+- **Global.json** – Permite fixar a versão do SDK usada em todo o repositório, garantindo que todos os desenvolvedores e pipelines utilizem a mesma ferramenta.
+
+## Examples & Code Walkthrough
+Vamos criar um microserviço que expõe um endpoint `/weather` retornando a previsão do tempo de uma cidade informada via query string. O serviço usa um cliente HTTP tipado e trata falhas de rede com política de retry.
+
+### 1. Criar a solução e o projeto
+```bash
+# Cria uma nova solution vazia
+dotnet new sln -n WeatherDemo
+
+# Cria um projeto de API ASP.NET Core mínimo
+dotnet new webapi -n WeatherApi --no-https
+
+# Adiciona o projeto à solution
+dotnet sln WeatherDemo.sln add WeatherApi/WeatherApi.csproj
+```
+
+### 2. Adicionar pacotes necessários
+```bash
+cd WeatherApi
+dotnet add package Microsoft.Extensions.Http.Polly
+dotnet add package Microsoft.Extensions.Configuration.Json
+```
+
+### 3. Estrutura de pastas
+```
+WeatherApi/
+├─ Controllers/
+│   └─ WeatherController.cs
+├─ Services/
+│   └─ IWeatherService.cs
+│   └─ WeatherService.cs
+├─ appsettings.json
+├─ Program.cs
+└─ WeatherApi.csproj
+```
+
+### 4. appsettings.json
+```json
+{
+  "WeatherApi": {
+    "BaseUrl": "https://api.open-meteo.com/v1/forecast",
+    "TimeoutSeconds": 10
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft": "Warning"
+    }
+  }
+}
+```
+
+### 5. IWeatherService.cs
+```csharp
+using System.Threading.Tasks;
+
+namespace WeatherApi.Services
+{
+    public interface IWeatherService
+    {
+        /// <summary>
+        /// Obtém a previsão de temperatura para as coordenadas informadas.
+        /// </summary>
+        /// <param name="latitude">Latitude da localização.</param>
+        /// <param name="longitude">Longitude da localização.</param>
+        /// <returns>Temperatura atual em Celsius.</returns>
+        Task<double> GetCurrentTemperatureAsync(double latitude, double longitude);
+    }
+}
+```
+
+### 6. WeatherService.cs
+```csharp
+using System;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Http.Polly;
+using Polly;
+using Polly.Retry;
+
+namespace WeatherApi.Services
+{
+    public class WeatherService : IWeatherService
+    {
+        private readonly HttpClient _http;
+        private readonly string _baseUrl;
+        private readonly AsyncRetryPolicy _retryPolicy;
+
+        public WeatherService(HttpClient http, IConfiguration config)
+        {
+            _http = http ?? throw new ArgumentNullException(nameof(http));
+            _baseUrl = config["WeatherApi:BaseUrl"]
+                       ?? throw new InvalidOperationException("WeatherApi:BaseUrl ausente na configuração.");
+
+            // Configura política de retry: até 3 tentativas com espera exponencial
+            _retryPolicy = Policy
+                .Handle<HttpRequestException>()
+                .Or<TaskCanceledException>()
+                .WaitAndRetryAsync(
+                    retryCount: 3,
+                    sleepDurationProvider: attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)),
+                    onRetry: (exception, timespan, retryNumber, context) =>
+                    {
+                        // Log simples; em produção usar ILogger
+                        Console.WriteLine($"Retry {retryNumber} após {timespan.TotalSeconds}s devido a {exception.Message}");
+                    });
+        }
+
+        public async Task<double> GetCurrentTemperatureAsync(double latitude, double longitude)
+        {
+            var requestUrl = $"{_baseUrl}?latitude={latitude}&longitude={longitude}&current_weather=true";
+
+            // Aplica a política de retry ao enviar a requisição
+            var response = await _retryPolicy.ExecuteAsync(async () =>
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, requestUrl);
+                return await _http.SendAsync(request);
+            });
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException(
+                    $"API externa retornou status {(int)response.StatusCode}: {response.ReasonPhrase}");
+            }
+
+            using var stream = await response.Content.ReadAsStreamAsync();
+            using var doc = await JsonDocument.ParseAsync(stream);
+            var root = doc.RootElement;
+
+            // O JSON retornado tem a estrutura: { "current_weather": { "temperature": 15.2, ... } }
+            if (root.TryGetProperty("current_weather", out var current) &&
+                current.TryGetProperty("temperature", out var temp))
+            {
+                return temp.GetDouble();
+            }
+
+            throw new InvalidOperationException("Resposta da API não contém o campo temperature esperado.");
+        }
+    }
+}
+```
+
+### 7. WeatherController.cs
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using WeatherApi.Services;
+
+namespace WeatherApi.Controllers
+{
+    [ApiController]
+    [Route("[controller]")]
+    public class WeatherController : ControllerBase
+    {
+        private readonly IWeatherService _weatherService;
+        private readonly ILogger<WeatherController> _logger;
+
+        public WeatherController(IWeatherService weatherService, ILogger<WeatherController> logger)
+        {
+            _weatherService = weatherService ?? throw new ArgumentNullException(nameof(weatherService));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        [HttpGet]
+        public async Task<ActionResult<double>> Get([FromQuery] double latitude, [FromQuery] double longitude)
+        {
+            try
+            {
+                var temperature = await _weatherService.GetCurrentTemperatureAsync(latitude, longitude);
+                _logger.LogInformation("Temperatura obtida: {Temp}°C para lat={Lat}, lon={Lon}",
+                    temperature, latitude, longitude);
+                return Ok(temperature);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning(ex, "Falha ao obter previsão para lat={Lat}, lon={Lon}", latitude, longitude);
+                return StatusCode(502, $"Erro ao consultar serviço externo: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Erro inesperado ao processar requisição de clima");
+                return StatusCode(500, "Ocorreu um erro interno.");
+            }
+        }
+    }
+}
+```
+
+### 8. Program.cs (ASP.NET Core 6+ minimal hosting)
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+// Adiciona controle de logging e configuração
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+// Registra o HttpClient tipado com política de Polly
+builder.Services.AddHttpClient<IWeatherService, WeatherService>()
+    .AddPolicyHandler(Policy.TimeoutAsync<HttpResponseMessage>(TimeSpan.FromSeconds(10)));
+
+var app = builder.Build();
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.UseHttpsRedirection();
+app.UseAuthorization();
+app.MapControllers();
+
+app.Run();
+```
+
+### 9. Dockerfile (para publicar como container)
+```dockerfile
+# Etapa de build
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+# Copia apenas os arquivos de projeto para aproveitar cache de restauração
+["WeatherApi/WeatherApi.csproj", "./"]
+RUN dotnet restore
+COPY . .
+RUN dotnet publish "WeatherApi/WeatherApi.csproj" -c Release -o /app/publish --no-restore
+
+# Etapa de runtime
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
+WORKDIR /app
+COPY --from=build /app/publish .
+ENTRYPOINT ["dotnet", "WeatherApi.dll"]
+```
+
+### 10. Build, teste e publicar localmente
+```bash
+# Resta

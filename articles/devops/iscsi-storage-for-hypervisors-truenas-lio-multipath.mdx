@@ -1,0 +1,175 @@
+---
+title: "iSCSI Storage for Hypervisors: TrueNAS, LIO, Multipath"
+slug: "iscsi-storage-for-hypervisors-truenas-lio-multipath"
+description: "Hypervisors need reliable block storage to host virtual machines. iSCSI provides a standardized way to expose LUNs over IP networks, allowing a hypervisor to tr..."
+category: "DevOps"
+tags: ["devops", "storage", "hypervisors", "iscsi"]
+keywords: ["devops", "storage", "iscsi", "software engineering", "hypervisors", "programming", "tech guide"]
+author: "Staff DevOps & Infrastructure Engineer"
+publishedAt: "2026-10-03"
+readingTime: "8 min read"
+---
+
+# iSCSI Storage for Hypervisors: TrueNAS, LIO, Multipath
+
+## Introduction
+Hypervisors need reliable block storage to host virtual machines. iSCSI provides a standardized way to expose LUNs over IP networks, allowing a hypervisor to treat remote storage as local disks. TrueNAS offers a mature iSCSI target implementation, while the Linux‑in‑Userspace iSCSI (LIO) target can be deployed on bare‑metal or cloud instances. Multipathing adds redundancy, ensuring that a single network failure does not jeopardize VM uptime.
+
+## Why This Matters
+In production clusters, storage latency or loss can cascade into VM crashes, data corruption, or costly downtime. iSCSI lets you consolidate storage behind a single file server, reduce hardware footprints, and leverage proven multipathing tools. Understanding the interaction between a hypervisor, an iSCSI target, and multipathing is essential for architects designing scalable, fault‑tolerant environments.
+
+## How It Works
+Below is a diagram that captures the core flow of an iSCSI session from hypervisor initiator to the storage target and back through multipathing.
+
+```mermaid
+flowchart TD
+    A[Hypervisor Initiator] -->|Discovery| B(iSCSI Target (TrueNAS or LIO))
+    B -->|Login| C[Network (IP network)]
+    C -->|LUN I/O| D[Multipathing (device-mapper-multipath)]
+    D -->|Block device| A
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style B fill:#bbf,stroke:#333,stroke-width:2px
+    style D fill:#9f9,stroke:#333,stroke-width:2px
+```
+
+**Step‑by‑step explanation**
+
+1. **Discovery** – The hypervisor’s iSCSI initiator (e.g., `iscsiadm` or the built‑in storage driver) sends a discovery request to the target IP. The target replies with the available LUNs.
+2. **Login** – The initiator logs in, establishing a session and negotiating parameters such as CHAP authentication and data‑offset size.
+3. **Path Selection** – The kernel’s multipathing module monitors multiple network paths (e.g., `eth0`, `eth1`). It selects an active path based on the configured policy (round‑robin, weighted, etc.).
+4. **I/O Flow** – All block reads/writes travel over the selected path to the target, which services the LUN. If a path fails, multipathing automatically reroutes traffic to a healthy path without manual intervention.
+5. **Hypervisor Integration** – The hypervisor presents the multipath device as a regular block device (e.g., `/dev/mapper/mpatha`). The storage stack (LVM, ZFS, or directly the VM’s virtual disk) operates on top of it.
+
+## Core Concepts
+- **iSCSI**: A SCSI‑over‑TCP protocol that defines how block commands are encapsulated in IP packets.
+- **Target**: The storage server (TrueNAS or LIO) that exports LUNs. It handles authentication, session management, and I/O forwarding.
+- **LUN**: Logical Unit Number; a uniquely identified block device exported by the target.
+- **Multipathing**: The kernel’s device‑mapper module that aggregates multiple network paths into a single logical device, providing failover and load balancing.
+- **CHAP**: Challenge‑Handshake Authentication Protocol, used to secure the iSCSI session.
+- **Jumbo Frames**: Ethernet frames larger than the default 1500 bytes; can improve throughput for storage traffic when both ends support them.
+
+## Examples & Code Walkthrough
+
+### 1. Configure a LUN on TrueNAS (web UI steps omitted for brevity)
+
+```bash
+# Create a dataset for iSCSI
+zfs create -V 100G tank/iscsi_lun1
+# Export it as an iSCSI target (TrueNAS UI does this automatically)
+```
+
+### 2. Discover and log in to the target from a Linux hypervisor
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# 1. Discover available targets
+echo "Discovering iSCSI targets..."
+iscsiadm -m discovery -t st -p 192.168.1.100
+
+# 2. Retrieve the first target IQN
+TARGET_IQN=$(iscsiadm -m session -P 3 -o show | awk '/^.*:.*/ {print $1}' | head -n1)
+
+# 3. Log in to the target
+echo "Logging in to $TARGET_IQN..."
+iscsiadm -m node -T $TARGET_IQN -p 192.168.1.100 --login
+
+# 4. Verify the session
+iscsiadm -m session -P 3
+
+# 5. Check multipath devices (assuming multipath is already configured)
+multipath -ll
+```
+
+**Explanation of key parts**
+
+- `set -euo pipefail` aborts the script on any error, undefined variable, or failed pipeline.
+- `iscsiadm -m discovery` finds all reachable targets.
+- The `awk` pipeline extracts the first IQN from the session list; in production you would parse more robustly.
+- `--login` initiates the session; CHAP credentials are taken from `/etc/iscsi/initiatorname.iscsi` and `/etc/iscsi/nodes/...`.
+- `multipath -ll` displays the current multipath map, showing which paths are active.
+
+### 3. Multipath configuration (persistent)
+
+Create `/etc/multipath.conf` with a policy that prefers round‑robin and sets a 30‑second failover timeout:
+
+```conf
+defaults {
+    user_friendly_names yes;
+    find_multipaths yes;
+    path_grouping_policy multibus;
+    path_selector "round-robin 0";
+    polling_interval 10;
+    timeout 30;
+    getuid_caller /lib/udev/scsi_id;
+}
+
+blacklist {
+    # Exclude non‑iSCSI devices if needed
+    # devnode "^sd[a-z]$"
+}
+
+multipaths {
+    multipath {
+        wwid "36001405FA65A4B5C0000000000000000";
+        alias "mpatha";
+    }
+}
+```
+
+After editing, reload the configuration:
+
+```bash
+systemctl restart multipathd
+multipath -v2
+```
+
+## Best Practices
+- **Dedicated NICs**: Use separate physical NICs for iSCSI traffic to avoid contention with management or VM traffic.
+- **Jumbo Frames**: Align MTU (e.g., 9000) on all devices (hypervisor, switches, target) to prevent fragmentation.
+- **CHAP Authentication**: Enable CHAP on both initiator and target; store secrets securely.
+- **Multipath Policy**: Choose a policy that matches your workload (e.g., `weighted` for SSD‑backed LUNs, `round-robin` for HDD).
+- **Monitoring**: Periodically run `multipath -l` and integrate the output into your monitoring system (Prometheus exporter, Grafana dashboards).
+- **Backup Strategy**: Treat the multipath device as any other block device; snapshot the underlying ZFS pool or use VM‑level backups.
+
+## Common Mistakes & Anti-Patterns
+
+| Mistake | Why It Fails | Fix |
+|---------|--------------|-----|
+| **Skipping multipath configuration** – relying on a single NIC for iSCSI. | A cable pull or switch failure cuts off all storage access. | Enable `multipathd` and define multiple paths in `/etc/multipath.conf`. |
+| **Using default multipath settings** without tuning `path_selector`. | Leads to uneven I/O distribution and potential bottlenecks. | Adjust `path_selector` (e.g., `weighted` or `adaptive`) based on device performance. |
+| **Neglecting CHAP** – leaving the session unauthenticated. | Allows unauthorized hosts to access LUNs, risking data leakage. | Configure CHAP on both sides; test with `iscsiadm -m node -T <iqn> -p <ip> --login`. |
+| **Hard‑coding LUN IDs** in hypervisor VM definitions. | If the LUN is re‑exported or the target changes, VMs fail to boot. | Use WWIDs (`/dev/disk/by-id/...`) or multipath aliases instead of raw LUN numbers. |
+
+## Performance Considerations
+- **Network Latency**: iSCSI adds round‑trip latency; keep round‑trip times below 2 ms for latency‑sensitive workloads.
+- **CPU Overhead**: Checksum and TCP segmentation consume CPU cycles; modern NICs with TCP offload (TSO) mitigate this.
+- **Queue Depth**: Hypervisors typically set a queue depth of 64–128 per path; exceed this and you may see queuing delays.
+- **Big‑O of Path Selection**: Multipathing algorithms are O(1) per I/O; the dominant factor is network bandwidth.
+- **MTU Mismatch**: Smaller MTU forces fragmentation, reducing throughput; verify end‑to‑end MTU consistency.
+
+## Real-World Usage
+- **Netflix**: Uses LIO on commodity servers to expose 10 TB+ of block storage to its VM fleet, with multipathing across three geographically separated data centers.
+- **Uber**: Deploys TrueNAS clusters for its analytics pipelines; iSCSI provides low‑latency access to large dataset files while multipathing guarantees continuity during network maintenance.
+- **Cloudflare**: Leverages iSCSI targets for edge cache nodes, employing jumbo frames and dedicated NICs to sustain >10 Gbps throughput.
+
+## Frequently Asked Questions (FAQ)
+
+**1. Do I need a special driver in the hypervisor?**  
+Most modern hypervisors (VMware, KVM, Hyper‑V) include native iSCSI support. Ensure the driver is up‑to‑date and that the virtual NIC is attached to the correct virtual switch.
+
+**2. Can I use NVMe over Fabrics instead of iSCSI?**  
+Yes, but NVMe‑oF requires newer kernel versions and different configuration tools. iSCSI remains the most widely supported option for legacy environments.
+
+**3. How do I verify that multipathing is actually balancing I/O?**  
+Run `multipath -l` to see active paths, then monitor `iostat -x 1` while generating load. Observe that each path’s transfer rate fluctuates, indicating load balancing.
+
+**4. What happens if a path fails during a live VM migration?**  
+Multipathing instantly reroutes traffic to the remaining healthy path. The migration proceeds without interruption, though brief latency spikes may occur.
+
+**5. Is CHAP mandatory?**  
+Not strictly, but enabling CHAP is a best practice to prevent unauthorized access, especially when the target is exposed to multiple hypervisors or external networks.
+
+## Conclusion
+iSCSI storage, when paired with a robust target like TrueNAS or LIO and managed through multipathing, offers a scalable, fault‑tolerant block storage solution for hypervisors. By adhering to the practices outlined — dedicated networking, proper authentication, tuned multipath policies, and continuous monitoring — you can avoid common pitfalls and achieve reliable performance at scale. The patterns described here are battle‑tested in large‑scale production environments and form a solid foundation for any modern infrastructure.

@@ -1,0 +1,235 @@
+---
+title: "Linux Server User Management: A Complete Practical Guide"
+slug: "linux-server-user-management-a-complete-practical-guide"
+description: "Managing user accounts on Linux servers sounds like solved problem. It’s not. Every major breach I’ve investigated in the last decade started with a credential ..."
+category: "Cybersecurity"
+tags: ["user", "linux", "cybersecurity", "server"]
+keywords: ["linux", "software engineering", "user", "programming", "tech guide", "server", "cybersecurity"]
+author: "Principal Cybersecurity Specialist"
+publishedAt: "2026-10-07"
+readingTime: "8 min read"
+---
+
+# Linux Server User Management: A Complete Practical Guide
+
+## Introduction
+
+Managing user accounts on Linux servers sounds like solved problem. It’s not. Every major breach I’ve investigated in the last decade started with a credential issue: a shared root password, a service account with a never-expiring key, a sudoers rule written during an outage at 3 AM and never reverted. The tooling—`useradd`, `passwd`, `visudo`—is deceptively simple. The discipline required to operate it safely at scale is not.
+
+This guide covers the full lifecycle: provisioning, authentication hardening (PAM, MFA, SSSD), authorization via sudo drop-ins, auditing with `auditd`, and automated deprovisioning. We’ll skip the man-page regurgitation and focus on the patterns that survive production pressure.
+
+## Why This Matters
+
+In our environment—roughly 2,000 nodes across bare metal and cloud—we treat local accounts as a liability. Every human interactive login is a potential pivot point. Every service account is a potential persistence mechanism.
+
+The pain points are always the same:
+*   **Credential drift:** A developer gets `sudo ALL=(ALL) NOPASSWD:ALL` "temporarily" to debug a deployment. Six months later, that account is still there.
+*   **Orphaned access:** An engineer leaves. Their LDAP account is disabled, but their SSH keys remain authorized on 400 hosts because nobody ran the offboarding playbook.
+*   **Audit gaps:** `lastlog` shows *when* someone logged in. It doesn't show *what they ran* via `sudo` unless you configured `auditd` or `sudo` logging explicitly.
+
+We solve this by treating user management as infrastructure code: immutable, auditable, and automated. If you can't reproduce your `/etc/passwd` state from Git, you don't own your identity layer.
+
+## How It Works
+
+The core mechanism isn't a single daemon. It's the interaction between the Name Service Switch (NSS), Pluggable Authentication Modules (PAM), the sudoers policy engine, and the Linux Audit subsystem. Understanding the data flow—specifically where the decision to *allow* or *deny* happens—is critical for debugging lockouts and designing least-privilege policies.
+
+```mermaid
+flowchart TD
+    subgraph Client["Client Request"]
+        SSH[SSH Client] -->|TCP 22| SSHD[sshd Daemon]
+        SUDO[sudo Command] -->|Local Exec| SUDO_BIN[sudo Binary]
+    end
+
+    subgraph NSS["Name Service Switch /etc/nsswitch.conf"]
+        direction LR
+        FILES[(/etc/passwd<br>/etc/shadow)]
+        SSSD[SSSD / LDAP<br>Cache]
+        NSS_LIB{nsswitch.conf<br>Resolution Order}
+        FILES --> NSS_LIB
+        SSSD --> NSS_LIB
+    end
+
+    subgraph PAM["PAM Stack /etc/pam.d/sshd & sudo"]
+        direction TB
+        AUTH[auth<br>pam_unix / pam_sss / pam_google_auth]
+        ACCT[account<br>pam_access / pam_faillock]
+        PASS[password<br>pam_pwquality / pam_unix]
+        SESS[session<br>pam_limits / pam_env / pam_systemd]
+        AUTH --> ACCT --> PASS --> SESS
+    end
+
+    subgraph SUDOERS["Sudo Policy Engine"]
+        POLICY[/etc/sudoers.d/<br>Drop-in Files]
+        LOGS[/var/log/sudo.log<br>JSON Audit]
+        POLICY -->|Eval| LOGS
+    end
+
+    subgraph AUDIT["Linux Audit Subsystem"]
+        AUDITD[auditd / kauditd]
+        RULES[/etc/audit/rules.d/<br>identity.rules]
+        AUSearch[ausearch / aureport]
+        RULES --> AUDITD --> AUSearch
+    end
+
+    SSHD -->|User Lookup| NSS_LIB
+    SSHD -->|Auth Request| PAM
+    SUDO_BIN -->|User Lookup| NSS_LIB
+    SUDO_BIN -->|Policy Check| SUDOERS
+    SUDO_BIN -->|Execve Audit| AUDITD
+    PAM -->|Session Open| AUDITD
+    NSS_LIB -->|UID/GID Map| SSHD
+    NSS_LIB -->|UID/GID Map| SUDO_BIN
+
+    style PAM fill:#f9f,stroke:#333,stroke-width:2px
+    style SUDOERS fill:#bbf,stroke:#333,stroke-width:2px
+    style AUDIT fill:#bfb,stroke:#333,stroke-width:2px
+```
+
+**The Flow:**
+1.  **Identity Resolution (NSS):** `sshd` or `sudo` asks libc "Who is UID 1001?". Libc consults `/etc/nsswitch.conf`. Order matters: `files sss` means check local `/etc/passwd` *first*, then ask SSSD (LDAP/AD). Get this wrong, and local break-glass accounts stop working when the LDAP server is unreachable.
+2.  **Authentication (PAM `auth` stack):** `sshd` invokes the `sshd` PAM service. Modules run in order: `pam_google_authenticator` (TOTP) -> `pam_unix` (local password) -> `pam_sss` (LDAP/Kerberos). `sufficient` vs `required` control flags dictate short-circuit behavior.
+3.  **Authorization (Account/Session):** `pam_access.so` checks `/etc/security/access.conf` (e.g., `+ : wheel : ALL`, `- : ALL : ALL`). `pam_faillock.so` bricks the account after N failures.
+4.  **Privilege Escalation (Sudo):** `sudo` reads `/etc/sudoers` + `/etc/sudoers.d/*`. It evaluates `Defaults` (log format, `log_input`/`log_output`), then matches the command against `Cmnd_Alias` entries.
+5.  **Audit (Kernel):** Every `execve`, `setuid`, and `open` on sensitive files (`/etc/shadow`, `/etc/sudoers`) generates a netlink message to `auditd`. We correlate `auid` (login UID) with `uid` (effective UID) to attribute actions post-sudo.
+
+## Core Concepts
+
+### Least Privilege via Sudo Drop-Ins
+Never edit `/etc/sudoers` directly. Use `/etc/sudoers.d/` with filenames matching the user or role (`jenkins`, `dba-ro`, `incident-response`). This enables GitOps: the file *is* the policy. `visudo -c -f /etc/sudoers.d/jenkins` validates syntax before deployment.
+
+### UID/GID Hygiene
+*   **System accounts (UID < 1000):** No login shell (`/usr/sbin/nologin`), no home directory, no password hash (`!!` in `/etc/shadow`).
+*   **Human accounts (UID >= 1000):** Managed via LDAP/SSSD ideally. If local, enforce `UID_MIN`/`UID_MAX` in `/etc/login.defs`.
+*   **Service accounts:** Dedicated UID per service. Never run `postgres` and `nginx` as the same user. Container runtimes (containerd, CRI-O) handle this via `runAsUser` in K8s, but on bare metal VMs, you must allocate ranges manually (e.g., 2000-2999 for app services).
+
+### The `pam_faillock` vs `pam_tally2` Trap
+`pam_tally2` is deprecated. Use `pam_faillock.so`. It stores state in `/var/run/faillock` (tmpfs, survives reboot? No, but `dir=/var/lib/faillock` persists it). Critical config: `even_deny_root` and `unlock_time=900`. Without `even_deny_root`, a brute-force attack on `root` locks the console, requiring a reboot into single-user mode to recover.
+
+### SSSD: The Cache Is Your Friend
+SSSD caches credentials locally. If the AD DC goes down, users *still log in* using cached hashes. Configure `cache_credentials = True` and `offline_credentials_expiration = 7` (days). Monitor `sssd_*_log` for "Server not found" storms—that's your early warning for network partitions.
+
+## Examples & Code Walkthrough
+
+### 1. Idempotent User Provisioning (Ansible + Bash Wrapper)
+We don't run `useradd` by hand. We use Ansible to render a hardened drop-in script that handles the "first login" dance: forced password rotation, MFA enrollment trigger, and audit logging.
+
+**File: `roles/linux-hardening/files/create-managed-user.sh`**
+```bash
+#!/usr/bin/env bash
+# create-managed-user.sh
+# Idempotent creation of a managed human account.
+# Usage: create-managed-user.sh <username> <ssh_pubkey_path> [--sudo-role=role_name]
+# Exits 0 on success, 1 on invalid args, 2 on user exists (idempotent), >2 on failure.
+
+set -euo pipefail
+
+# --- Config ---
+readonly SKEL_DIR="/etc/skel-managed"       # Custom skel with .bashrc, .vimrc, mfa-enroll hint
+readonly SUDO_DIR="/etc/sudoers.d"
+readonly AUDIT_TAG="user-lifecycle"
+readonly MIN_UID=2000
+readonly MAX_UID=9999
+
+# --- Args ---
+USERNAME="${1:-}"
+SSH_KEY_PATH="${2:-}"
+SUDO_ROLE="${3:-}" # Optional: maps to a file in /etc/sudoers.d/roles/
+
+if [[ -z "$USERNAME" || -z "$SSH_KEY_PATH" ]]; then
+    echo "Usage: $0 <username> <ssh_pubkey_path> [--sudo-role=role]" >&2
+    exit 1
+fi
+
+if [[ ! -f "$SSH_KEY_PATH" ]]; then
+    echo "ERROR: SSH public key not found at $SSH_KEY_PATH" >&2
+    exit 1
+fi
+
+# --- Idempotency Check ---
+if id "$USERNAME" &>/dev/null; then
+    echo "INFO: User '$USERNAME' already exists. Updating keys/sudo only."
+    UPDATE_MODE=1
+else
+    UPDATE_MODE=0
+fi
+
+# --- UID Allocation (Deterministic but safe) ---
+# In production, we pull this from an IPAM/UID registry API. Here we scan locally.
+allocate_uid() {
+    local used_uids
+    # Get all UIDs in range, sort numerically
+    used_uids=$(awk -F: -v min="$MIN_UID" -v max="$MAX_UID" '$3 >= min && $3 <= max {print $3}' /etc/passwd | sort -n)
+    local next_uid=$MIN_UID
+    for uid in $used_uids; do
+        if [[ $uid -eq $next_uid ]]; then
+            ((next_uid++))
+        elif [[ $uid -gt $next_uid ]]; then
+            break
+        fi
+    done
+    if [[ $next_uid -gt $MAX_UID ]]; then
+        echo "ERROR: UID range exhausted." >&2
+        exit 3
+    fi
+    echo "$next_uid"
+}
+
+# --- Main Logic ---
+if [[ $UPDATE_MODE -eq 0 ]]; then
+    ALLOC_UID=$(allocate_uid)
+    echo "Provisioning $USERNAME with UID $ALLOC_UID"
+
+    # Create user: no password (SSH key only), custom skel, nologin until MFA enrolled
+    # We use /bin/bash as shell but lock password. PAM handles MFA requirement.
+    useradd -m -u "$ALLOC_UID" -k "$SKEL_DIR" -s /bin/bash -c "Managed User" "$USERNAME"
+    passwd -l "$USERNAME" >/dev/null  # Lock password auth explicitly
+
+    # Force MFA enrollment on first login via PAM env var / profile.d script
+    # (See pam.d/sshd config below)
+    chage -d 0 "$USERNAME" # Expire password immediately (triggers pam_pwquality if unlock attempted)
+else
+    ALLOC_UID=$(id -u "$USERNAME")
+fi
+
+# --- SSH Key Management (AuthorizedKeysCommand preferred, but file fallback) ---
+USER_HOME=$(getent passwd "$USERNAME" | cut -d: -f6)
+SSH_DIR="$USER_HOME/.ssh"
+AUTH_KEYS="$SSH_DIR/authorized_keys"
+
+install -d -m 700 -o "$USERNAME" -g "$USERNAME" "$SSH_DIR"
+# Append key if not present (idempotent)
+grep -qxF "$(cat "$SSH_KEY_PATH")" "$AUTH_KEYS" 2>/dev/null || cat "$SSH_KEY_PATH" >> "$AUTH_KEYS"
+chmod 600 "$AUTH_KEYS"
+chown -R "$USERNAME:$USERNAME" "$SSH_DIR"
+
+# --- Sudo Drop-in ---
+if [[ -n "$SUDO_ROLE" ]]; then
+    ROLE_FILE="$SUDO_DIR/roles/$SUDO_ROLE"
+    if [[ ! -f "$ROLE_FILE" ]]; then
+        echo "ERROR: Sudo role '$SUDO_ROLE' not found at $ROLE_FILE" >&2
+        exit 4
+    fi
+    # Symlink user -> role. Allows atomic role updates.
+    ln -sfn "$ROLE_FILE" "$SUDO_DIR/$USERNAME"
+    chmod 440 "$SUDO_DIR/$USERNAME"
+    logger -t "$AUDIT_TAG" "Linked sudo role '$SUDO_ROLE' to user '$USERNAME'"
+else
+    # Ensure no stray sudo file exists if role removed
+    rm -f "$SUDO_DIR/$USERNAME"
+fi
+
+# --- Audit Log ---
+logger -t "$AUDIT_TAG" "user=$USERNAME uid=$ALLOC_UID action=provision update=$UPDATE_MODE sudo_role=${SUDO_ROLE:-none}"
+
+echo "SUCCESS: User '$USERNAME' (UID: $ALLOC_UID) is ready."
+exit 0
+```
+
+**Key details:**
+*   **Idempotency:** Checks `id` first. Updates keys/sudo without recreating.
+*   **UID Allocation:** Scans `/etc/passwd` for gaps. In real life, hit a central UID service (Consul, etcd, or a simple SQLite DB) to avoid collisions across nodes.
+*   **`passwd -l`:** Locks the password hash in `/etc/shadow` (`!` prefix). User *must* use SSH key + MFA.
+*   **Sudo Symlinks:** `$SUDO_DIR/$USERNAME` -> `$SUDO_DIR/roles/dba-ro`. Changing the role definition updates everyone instantly. No `visudo` editing required.
+
+### 2. Hardened PAM Stack for SSH (`/etc/pam.d/sshd`)
+This stack enforces: TOT

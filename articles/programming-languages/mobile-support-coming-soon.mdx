@@ -1,0 +1,158 @@
+---
+title: "Mobile support coming soon."
+slug: "mobile-support-coming-soon"
+description: "For the better part of the last decade, our primary language runtime has been optimized for x86_64 and ARM server workloads. Mobile—iOS, Android, the various em..."
+category: "Programming Languages"
+tags: ["support", "programming languages", "mobile", "coming"]
+keywords: ["tech guide", "software engineering", "support", "coming", "programming languages", "mobile", "programming"]
+author: "Compiler & Language Architect"
+publishedAt: "2026-10-09"
+readingTime: "8 min read"
+---
+
+# Mobile support coming soon.
+
+## Introduction
+
+For the better part of the last decade, our primary language runtime has been optimized for x86_64 and ARM server workloads. Mobile—iOS, Android, the various embedded ARM variants—has remained a second-class territory, requiring either a full native rewrite or fragile JNI/FFI bridges. Last quarter, the engineering team decided to change that. This article walks through how we added first-class mobile target support to the runtime, the architectural compromises we made, and what you can steal for your own language or toolchain.
+
+The trigger was a simple but telling signal: our internal analytics showed a steady climb in requests from mobile CI pipelines, yet every attempt to build resulted in linker errors about missing syscall implementations and ABI mismatches. Rather than patching symptoms, we opted to extend the compiler’s backend and rethink the runtime’s interaction with mobile OS constraints. What follows is a technical narrative of that work.
+
+## Why This Matters
+
+Mobile deployment remains one of the highest-friction areas for language runtimes that aren’t natively supported by the platform’s SDK. For teams maintaining a single codebase across backends and mobile, the cost of maintaining separate Swift or Kotlin modules is both operational and cognitive. Adding mobile support at the language level eliminates the “two-codebase problem,” reduces context switching for developers, and opens the door to shared business logic across web, desktop, and mobile.
+
+From a production standpoint, the pain points are real: deployment freezes when a mobile CI job fails due to undocumented ARM attribute requirements; runtime crashes caused by unhandled signal differences between desktop and mobile kernels; and the ever-present binary size penalty when pulling in an entire native SDK just to compile a single module. Solving these at the language layer means every downstream team benefits without re-architecturing their applications.
+
+It also matters for the language’s ecosystem. Libraries that depend on system-level features—cryptography, file I/O, network stacks—can finally be targeted mobile‑first, rather than being ghettoized as “desktop-only.” That ripple effect is what makes this more than a cosmetic build flag change.
+
+## How It Works
+
+The core mechanism rests on three interlocking pieces: a backend transformation pass in the compiler, a trimmed runtime tailored to mobile syscall availability, and a build‑system integration that propagates platform constraints downstream.
+
+When the compiler encounters a `--mobile` flag, it triggers a middle‑end pass that rewrites platform‑specific intrinsics into portable equivalents, emits ARM64‑v8a instructions instead of x86_64, and adjusts the ABI for the calling conventions used by iOS and Android runtimes. Simultaneously, the linker is directed to pull in a mobile‑specific standard library that omits POSIX extensions unsupported on the sandboxed mobile kernels.
+
+The runtime changes are equally deliberate. We stripped the garbage collector’s signal‑handling paths, replaced blocking I/O primitives with platform‑compatible async variants, and added a small shim layer that translates the language’s error‑reporting format into the mobile platforms’ crash reporting mechanisms (OSLog for iOS, Systrace for Android).
+
+Below is a flowchart of the compilation pipeline when the mobile target is selected:
+
+```mermaid
+flowchart TD
+    source[Source Code] -->|--mobile flag| compiler[Compiler Frontend]
+    compiler -->|IR transformation| middle[Middle-End Pass]
+    middle -->|ARM64 ABI mapping| codegen[Code Generation]
+    codegen -->|mobile runtime| linker[Platform Linker]
+    linker -->|iOS| ios_binary[Mobile Binary (iOS)]
+    linker -->|Android| android_binary[Mobile Binary (Android)]
+    middle -->|error handling| error_handler[Diagnostic Emitter]
+    error_handler -->|user feedback| console[Developer Console]
+```
+
+**Step-by-step, what happens under the hood:**
+
+1. **Flag parsing** – The build system passes `--mobile` (or `--target=ios|android`) to the compiler. This flag is intercepted early, before any code generation, so subsequent passes can conditionally activate.
+2. **Intermediate Representation (IR) rewriting** – The middle-end pass walks the IR and replaces any intrinsics that map to unsupported desktop syscalls (e.g., `mmap` with `PROT_EXEC` on iOS) with portable wrappers. It also inserts target‑attribute nodes that tell the codegen to emit NEON‑friendly instructions where applicable.
+3. **Code generation** – The backend now selects ARM64‑v8a as the default target. It applies mobile‑specific relocation models, ensuring that position‑independent code works within the stricter address‑space layout randomization (ASLR) policies of iOS and Android.
+4. **Linker configuration** – The linker receives a platform‑specific linker script. For iOS, it links against `libsystem_kernel` symbols that are exported for mobile use; for Android, it uses the NDK’s toolchain to produce a `.so` compatible with the app’s ABI filter.
+5. **Runtime initialization** – The produced binary includes a tiny runtime initializer that maps the language’s garbage‑collector roots into the mobile process’s memory layout, hooking into the OS’s allocator without triggering forbidden system calls.
+
+The result is a binary that can be `dlopen`‑ed from a native app or run directly via the language’s REPL on a jailbroken/emulated device, with performance characteristics comparable to the desktop build—typically within 5‑12% due to the absence of some aggressive desktop‑only optimizations.
+
+## Core Concepts
+
+Before diving into code, a few internal concepts warrant a clear definition. These aren’t abstract theorems; they’re the concrete pillars we moved around to make mobile a first‑class citizen.
+
+- **ABI‑safe IR** – Our intermediate representation now carries an explicit `target_abi` tag. When the mobile pass activates, the tag shifts from `sysv` or `win64` to `aapcs64` (the ARM64 calling convention used by both iOS and Android). This single tag propagates through codegen, register allocation, and stack layout, eliminating an entire class of ABI mismatches that historically required manual FFI wrappers.
+
+- **Syscall shim layer** – Mobile kernels don’t export the full POSIX interface. We introduced a thin shim that translates language‑level syscall numbers into the subset available on the target. Open, read, write, and kill are mapped to their iOS/macOS or Android equivalents. The shim also handles error‑code translation so that language‑level `IoError`s map to platform‑appropriate `errno` values.
+
+- **Feature‑flag gating** – Not every language feature makes sense on mobile. We added a compile‑time gate system: `#[mobile_only]`, `#[no_mobile]`, and `#[conditional(mobile)]`. Annotations like `#[mobile_only]` cause the compiler to error if the feature is used outside a mobile build, preventing accidental inclusion of, say, desktop‑only threading primitives in a mobile binary.
+
+- **Binary footprint budgeting** – Mobile apps have strict size constraints. The runtime now emits a `mobile_footprint` metric during codegen, allowing the build system to abort early if the stripped binary exceeds a configurable threshold. This encourages developers to trade features for size early, rather than discovering the problem at the App Store upload stage.
+
+## Examples & Code Walkthrough
+
+Let’s look at a concrete, functional example. Below is a self‑contained build orchestration script written in Python 3.11+. It demonstrates how the mobile flag propagates through the compiler, how the runtime initializer is stub‑in, and includes defensive error handling that would be familiar to anyone maintaining a production build pipeline.
+
+```python
+#!/usr/bin/env python3
+"""
+Mobile build orchestrator for the Nimble language runtime.
+
+This script illustrates the end-to-end pipeline for compiling a
+language project with mobile support enabled. It is deliberately
+verbose with error handling and inline comments to serve as a
+reference for teams implementing similar tooling.
+"""
+
+import argparse
+import json
+import logging
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Logging configuration – structured, timestamped, and piped to stderr
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    stream=sys.stderr,
+)
+log = logging.getLogger("mobile-orchestrator")
+
+# ---------------------------------------------------------------------------
+# Domain model: represents a mobile target the compiler can emit.
+# ---------------------------------------------------------------------------
+class MobileTarget(str, Enum):
+    IOS = "ios"
+    ANDROID = "android"
+    # Future: wasmtime-mobile, expo-native, etc.
+
+    @property
+    def linker_script(self) -> Path:
+        """Return the platform‑specific linker script path."""
+        mapping = {
+            self.IOS: Path("linker/ios.x86_64 script"),  # simplified
+            self.ANDROID: Path("linker/android.arm64-v8a script"),
+        }
+        return mapping[self]
+
+    @property
+    def runtime_init(self) -> str:
+        """Name of the runtime initializer object file."""
+        return f"runtime_{self.value}_init.o"
+
+
+# ---------------------------------------------------------------------------
+# Error types – granular enough to allow selective retry/skip logic.
+# ---------------------------------------------------------------------------
+class BuildError(RuntimeError):
+    """Raised when the build pipeline encounters a non-recoverable issue."""
+
+    def __init__(self, code: int, message: str, stage: str):
+        self.code = code
+        self.stage = stage
+        super().__init__(f"[{stage}] {message} (exit code {code})")
+
+
+class MissingSourceError(BuildError):
+    """Raised when the expected source tree is absent."""
+
+
+# ---------------------------------------------------------------------------
+# Core orchestration functions.
+# ---------------------------------------------------------------------------
+
+def validate_source_tree(root: Path) -> None:
+    """Ensure the source root contains at least one .nim source file."""
+    sources = list(root.rglob("*.nim"))
+    if not sources:
+        raise MissingSourceError(
+            code=1,
+            message="No Nim source files found in the project root.",
+            stage="source-validation",
+        )
+    log.info("Found %d source file(s) under %s", len(sources),

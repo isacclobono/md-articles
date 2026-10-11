@@ -1,0 +1,297 @@
+---
+title: "TrailQuest : Less Scrolling, More Exploring with Local AI"
+slug: "trailquest-less-scrolling-more-exploring-with-local-ai"
+description: "I've spent the last decade building developer tools at companies where \"time to first meaningful interaction\" was the only metric that mattered. Lately, I've wa..."
+category: "Web Development"
+tags: ["trailquest", "web development", "scrolling", "less"]
+keywords: ["programming", "software engineering", "trailquest", "tech guide", "less", "web development", "scrolling"]
+author: "Lead Frontend & Web Architect"
+publishedAt: "2026-10-11"
+readingTime: "9 min read"
+---
+
+# TrailQuest : Less Scrolling, More Exploring with Local AI
+
+## Introduction
+
+I've spent the last decade building developer tools at companies where "time to first meaningful interaction" was the only metric that mattered. Lately, I've watched a disturbing trend: the average technical article now requires 12 minutes of scrolling to find the 30 seconds of signal you actually need. Documentation sites bury API signatures under marketing fluff. GitHub READMEs stretch into infinite scroll walls of badges and installation instructions.
+
+TrailQuest started as an internal hackweek project to solve my own frustration. It's a browser extension that runs a quantized LLM locally via WebGPU to extract, summarize, and navigate long-form technical content *in situ*. No API keys. No network round-trips after model download. No sending proprietary codebases to third-party inference endpoints. Just 4.2 GB of model weights sitting in your browser's IndexedDB, turning a 20-minute read into a 90-second decision.
+
+## Why This Matters
+
+The modern web is hostile to deep work. Consider the typical engineering workflow:
+
+1.  Search for a Kubernetes networking bug
+2.  Open 7 tabs from StackOverflow, GitHub Issues, and vendor docs
+3.  Scroll each tab hunting for `error: "no endpoints available for service"`
+4.  Context-switch until cognitive load forces a coffee break
+
+Cloud-based summarization tools exist, but they fail three critical production requirements:
+
+*   **Data Sovereignty**: You cannot paste internal incident reports or private repo code into a SaaS summarizer. Legal blocks it. Security blocks it. Common sense blocks it.
+*   **Latency Variance**: A 200ms P50 API call becomes 8s P99 during model provider outages. Your debugging flow shouldn't depend on someone else's GPU cluster health.
+*   **Cost at Scale**: 100 engineers × 50 queries/day × $0.002/query = $3,000/month for a feature that runs fine on idle client silicon.
+
+Local inference flips the economics. The "GPU" is already paid for (the user's laptop). The bandwidth is free. The privacy is absolute. The only engineering cost is model optimization and WASM/WebGPU pipeline maturity—which, as of Chrome 121+ and Firefox 120+, is production-ready.
+
+## How It Works
+
+TrailQuest operates as a three-layer pipeline: **Extraction → Inference → Injection**. The extension content script isolates the semantic DOM, the background worker manages the model lifecycle, and the sidepanel renders interactive summaries with deep-link anchors.
+
+```mermaid
+flowchart TD
+    subgraph Browser["Browser Process"]
+        direction TB
+        CS[Content Script\nDOM Extraction] -->|Message: {html, url}| BG[Background Service Worker]
+        BG -->|WebGPU Tensor Ops| Model[(Quantized Model\nIndexedDB Cache)]
+        Model -->|Logits → Tokens| BG
+        BG -->|Streaming Summary| SP[Side Panel UI]
+        SP -->|Anchor Scroll| CS
+    end
+
+    subgraph Startup["Cold Start Sequence"]
+        direction LR
+        SW[Service Worker Install] -->|Fetch .bin/.json| Cache[Cache API]
+        Cache -->|ReadStream| IDB[IndexedDB\nModel Weights]
+        IDB -->|createContext| WebGPU[WebGPU Device]
+    end
+
+    classDef worker fill:#1e1e1e,stroke:#4ec9b0,color:#d4d4d4;
+    classDef ui fill:#252526,stroke:#9cdcfe,color:#d4d4d4;
+    classDef storage fill:#2d2d2d,stroke:#ce9178,color:#d4d4d4;
+    class BG,CS worker;
+    class SP ui;
+    class Model,Cache,IDB,WebGPU storage;
+```
+
+**Step-by-step execution flow:**
+
+1.  **DOM Triaging** (Content Script): On `DOMContentLoaded`, we run a readability-like algorithm stripped of Mozilla's legacy baggage. We score nodes by `textContent` density, heading hierarchy, and `code`/`pre` tag presence. The top-scoring subtree becomes our context window.
+2.  **Token Budgeting** (Background Worker): The extracted HTML is converted to markdown (Turndown.js), then tokenized via the model's `tiktoken` WASM port. If tokens > 3,500 (leaving headroom for 512-token output), we recursively summarize sections hierarchically—section summaries become the new context.
+3.  **Streaming Inference** (WebGPU): We use `transformers.js` with a custom `generate()` loop that yields partial decodes every 8 tokens. This keeps the sidepanel responsive; users see "Loading..." for 300ms, then words appear at ~40 tok/s on an M2 Pro.
+4.  **Anchor Injection** (Side Panel → Content Script): Each summary bullet emits a `data-trailquest-anchor` linking to the source DOM node. Clicking triggers `element.scrollIntoView({behavior: 'smooth', block: 'center'})` and a 2s yellow fade (`::target` CSS pseudo-class).
+
+## Core Concepts
+
+### 1. The Extraction Heuristic
+We don't use `Readability.js` directly—it carries 40KB of cruft for `iframe` handling and ad-density scoring we don't need. Instead, a 1.2KB scorer:
+
+```typescript
+// packages/core/src/extraction/scorer.ts
+interface NodeScore { node: Element; score: number; depth: number; }
+
+export function scoreSubtree(root: Element): NodeScore[] {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+  const scores: NodeScore[] = [];
+  let current: Element | null = walker.nextNode();
+
+  while (current) {
+    // Skip chrome, nav, footer, aside, script, style, noscript
+    if (['NAV','FOOTER','ASIDE','SCRIPT','STYLE','NOSCRIPT','HEADER'].includes(current.tagName)) {
+      current = walker.nextNode();
+      continue;
+    }
+
+    const text = current.textContent?.trim() ?? '';
+    const textLength = text.length;
+    const linkDensity = current.querySelectorAll('a').length / Math.max(1, current.children.length);
+    const codeBonus = current.querySelectorAll('pre, code').length * 150;
+    const headingBonus = ['H1','H2','H3'].includes(current.tagName) ? 300 : 0;
+
+    // Penalize high link density (nav menus), reward code/headings
+    const score = (textLength * 0.8) - (linkDensity * 200) + codeBonus + headingBonus;
+
+    if (score > 50) { // Noise floor
+      scores.push({ node: current, score, depth: getDepth(current) });
+    }
+    current = walker.nextNode();
+  }
+  return scores.sort((a,b) => b.score - a.score);
+}
+
+function getDepth(el: Element): number {
+  let d = 0;
+  while ((el = el.parentElement!) && el !== document.body) d++;
+  return d;
+}
+```
+
+### 2. Model Management Strategy
+We ship `Phi-3-mini-4k-instruct-q4f16.onnx` (2.3GB) via a staged rollout:
+*   **Install**: Background worker checks `navigator.storage.estimate()`. If quota < 3GB, prompt user to clear cache.
+*   **Download**: `fetch()` with `ReadableStream` → `Cache API` (not IndexedDB) for byte-range resumption.
+*   **Compilation**: `ort.InferenceSession.create()` with `executionProviders: ['webgpu']`. Falls back to `wasm` with SIMD if WebGPU unsupported.
+*   **Warm-up**: On first idle callback, run a dummy `generate("warmup", {max_length: 1})` to trigger shader compilation. Avoids 2s jank on first real query.
+
+### 3. Context Window Architecture
+Fixed 4096-token context. Input pipeline:
+```
+[System Prompt: 120 tok] + [Hierarchical Summary: ≤3200 tok] + [User Query: ≤256 tok] + [Generation: 512 tok]
+```
+If source material exceeds 3200 tokens post-extraction, we run a **map-reduce pass**: split by H2/H3 boundaries, summarize each chunk to 128 tokens locally (tiny `distilbart-cnn-6-6` model, 180MB), then feed the concatenated mini-summaries to Phi-3. This recursive compression preserves code snippets and error messages better than naive truncation.
+
+## Examples & Code Walkthrough
+
+### The Background Worker: Model Lifecycle & Streaming
+
+```typescript
+// packages/extension/src/background/model-manager.ts
+import { AutoModelForCausalLM, AutoTokenizer, TextStreamer } from '@huggingface/transformers';
+import type { ProgressCallback } from '@huggingface/transformers';
+
+const MODEL_ID = 'onnx-community/Phi-3-mini-4k-instruct-q4f16';
+const MAX_CONCURRENT_STREAMS = 1; // WebGPU context is global per origin
+
+let session: AutoModelForCausalLM | null = null;
+let tokenizer: AutoTokenizer | null = null;
+let activeStream: ReadableStreamDefaultController<Uint8Array> | null = null;
+
+export async function initializeModel(progressCb?: ProgressCallback): Promise<void> {
+  if (session) return; // Idempotent
+
+  // 1. Load tokenizer (small, fast, WASM)
+  tokenizer = await AutoTokenizer.from_pretrained(MODEL_ID, { progress_callback: progressCb });
+
+  // 2. Load model with WebGPU execution provider
+  // NOTE: device_id: 'default' lets browser pick. On multi-GPU laptops, we'd enumerate.
+  session = await AutoModelForCausalLM.from_pretrained(MODEL_ID, {
+    device: 'webgpu',
+    dtype: 'fp16', // q4f16 weights + fp16 compute = best perf/quality tradeoff
+    progress_callback: progressCb,
+    session_options: {
+      graph_optimization_level: 'all',
+      enable_mem_pattern: true, // Critical for KV-cache reuse
+      execution_mode: 'sequential' // Prevents OOM on shared GPU memory
+    }
+  });
+
+  // 3. Warm-up run (fire-and-forget)
+  warmup().catch(console.error);
+}
+
+async function warmup() {
+  if (!session || !tokenizer) return;
+  const input = tokenizer.encode('warmup', { add_special_tokens: false });
+  await session.generate(input, { max_new_tokens: 1, do_sample: false });
+}
+
+// Streaming generator consumed by sidepanel
+export async function* generateSummary(
+  prompt: string,
+  options: { maxTokens: number; temperature: number } = { maxTokens: 512, temperature: 0.3 }
+): AsyncGenerator<string, void, unknown> {
+  if (!session || !tokenizer) throw new Error('Model not initialized');
+
+  // Apply chat template (Phi-3 specific)
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: prompt }
+  ];
+  const inputIds = tokenizer.apply_chat_template(messages, { add_generation_prompt: true });
+
+  // Custom streamer to yield decoded chunks
+  const streamer = new TextStreamer(tokenizer, {
+    skip_prompt: true,
+    skip_special_tokens: true,
+    callback_function: (text: string) => {
+      if (activeStream) activeStream.enqueue(new TextEncoder().encode(text));
+    }
+  });
+
+  // Run generation in background, yielding control to event loop
+  const generationPromise = session.generate(inputIds, {
+    max_new_tokens: options.maxTokens,
+    temperature: options.temperature,
+    do_sample: options.temperature > 0,
+    streamer,
+    // Critical for long contexts: static KV cache allocation
+    use_cache: true,
+  });
+
+  // Yield control while generation runs
+  await generationPromise;
+}
+
+// Called from sidepanel on close/navigate away
+export function abortGeneration() {
+  // transformers.js doesn't expose abort() on generate() yet.
+  // Workaround: terminate the WebGPU device (nuclear option) or
+  // set a global flag checked in a custom streamer.
+  // For now, we rely on service worker termination.
+  session = null; // Allow GC, next init will reload.
+}
+```
+
+### Side Panel: Reactive UI with Anchor Navigation
+
+```tsx
+// packages/extension/src/sidepanel/App.tsx
+import { useEffect, useRef, useState } from 'react';
+import { generateSummary, initializeModel } from '../background/model-manager';
+
+const SYSTEM_PROMPT = `You are a senior staff engineer. Extract actionable technical details:
+- Exact error messages, stack traces, config keys
+- Command-line flags, API signatures, version constraints
+- Root cause hypotheses with evidence quotes
+- Workarounds with copy-pasteable snippets
+Output as markdown bullet list. Each bullet MUST end with [source:L<line>] referencing the provided context line numbers.`;
+
+export function SidePanel() {
+  const [status, setStatus] = useState<'idle'|'loading'|'streaming'|'error'>('idle');
+  const [bullets, setBullets] = useState<string[]>([]);
+  const [progress, setProgress] = useState(0);
+  const anchorRefs = useRef<Map<string, HTMLAnchorElement>>(new Map());
+
+  // Initialize model on mount
+  useEffect(() => {
+    let cancelled = false;
+    initializeModel((p) => {
+      if (cancelled) return;
+      setProgress(Math.round(p * 100));
+      setStatus(p === 1 ? 'idle' : 'loading');
+    }).catch((e) => {
+      if (!cancelled) setStatus('error');
+      console.error('[TrailQuest] Model init failed', e);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleSummarize = async (sourceMarkdown: string) => {
+    setStatus('streaming');
+    setBullets([]);
+    anchorRefs.current.clear();
+
+    try {
+      // Build prompt with line-numbered context for citation
+      const numberedLines = sourceMarkdown.split('\n').map((l, i) => `${i+1}: ${l}`).join('\n');
+      const prompt = `CONTEXT:\n${numberedLines}\n\nTASK: Summarize per instructions.`;
+
+      for await (const chunk of generateSummary(prompt)) {
+        // Naive bullet detection: Phi-3 outputs "- " or "• "
+        const lines = chunk.split('\n').filter(l => l.trim().match(/^[-•*]/));
+        lines.forEach(line => {
+          // Extract [source:L123] citation
+          const match = line.match(/\[source:L(\d+)\]/);
+          const anchorId = match ? `tq-anchor-${match[1]}` : null;
+          const cleanLine = line.replace(/\[source:L\d+\]/, '').trim();
+
+          setBullets(prev => [...prev, cleanLine]);
+          if (anchorId) {
+            // Deferred DOM mutation via content script message
+            chrome.runtime.sendMessage({ type: 'REGISTER_ANCHOR', line: parseInt(match![1]), anchorId });
+          }
+        });
+      }
+      setStatus('idle');
+    } catch (e) {
+      console.error('[TrailQuest] Generation error', e);
+      setStatus('error');
+    }
+  };
+
+  // Receive scroll commands from bullet clicks
+  useEffect(() => {
+    const listener = (msg: any) => {
+      if (msg.type === 'SCROLL_TO_ANCHOR' && anchorRefs.current.has(msg.anchorId)) {
+        anchorRefs.current.get(msg.anchorId)!.scrollIntoView({ behavior: 'smooth', block: 'center

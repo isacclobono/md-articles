@@ -1,0 +1,398 @@
+---
+title: "Building Resilient REST APIs with TypeScript, Node.js, and PostgreSQL"
+slug: "building-resilient-rest-apis-with-typescript-nodejs-and-postgresql"
+description: "When a public API crashes under load, the cost is measured in lost revenue, damaged reputation, and frantic on‑call rotations. Resilience isn’t a nice‑to‑have; ..."
+category: "Web Development"
+tags: ["rest", "web development", "building", "resilient"]
+keywords: ["software engineering", "programming", "resilient", "tech guide", "rest", "web development", "building"]
+author: "Lead Frontend & Web Architect"
+publishedAt: "2026-10-13"
+readingTime: "8 min read"
+---
+
+# Building Resilient REST APIs with TypeScript, Node.js, and PostgreSQL
+
+## Introduction  
+When a public API crashes under load, the cost is measured in lost revenue, damaged reputation, and frantic on‑call rotations. Resilience isn’t a nice‑to‑have; it’s a baseline requirement for any service that must survive latency spikes, database outages, or third‑party failures. In this article we walk through a pragmatic, production‑ready scaffold that incorporates timeout, retry, circuit‑breaker, bulkhead, rate‑limiting, graceful shutdown, and observability. You’ll end up with a fully typed, testable API that can be dropped into a CI/CD pipeline and deployed to Kubernetes, Docker, or any hosting platform.
+
+## Why This Matters  
+Backend teams constantly battle unpredictable failure modes: a sudden surge in request volume, a transient network glitch, or a schema migration that locks the tables. Without built‑in resilience patterns, each failure cascades into cascading timeouts for downstream services and unhappy clients. By embedding these patterns from day one, you reduce mean‑time‑to‑recovery (MTTR), protect database connections, and keep the API available even when the underlying components are flaky. The result is a system that behaves predictably under stress and gives engineers confidence to ship changes safely.
+
+## How It Works  
+The request flow can be visualized as a pipeline that applies resilience safeguards before reaching the data store and then returns a structured response.
+
+```mermaid
+flowchart TD
+    A[Client Request] --> B[Fastify Router]
+    B --> C{Rate Limit?}
+    C -->|Pass| D[Timeout Guard]
+    C -->|Block| E[429 Too Many Requests]
+    D --> F[Retry Wrapper]
+    F --> G{Circuit Breaker?}
+    G -->|Closed| H[Bulkhead Pool]
+    G -->|Open| I[503 Service Unavailable]
+    H --> J[Prisma Client]
+    J --> K[Database]
+    K --> L[Response Formatter]
+    L --> M[Structured Log]
+    M --> N[Return to Client]
+    subgraph "Resilience Layer"
+        C
+        D
+        F
+        G
+        H
+    end
+```
+
+1. **Rate Limiting** throttles inbound traffic to protect the database.  
+2. **Timeout Guard** aborts long‑running operations before they consume resources.  
+3. **Retry Wrapper** (using `async-retry`) transparently re‑issues failed calls a configurable number of times.  
+4. **Circuit Breaker** (via `opossum`) stops traffic to a failing upstream after a threshold, falling back to a safe response.  
+5. **Bulkhead Pool** (`p-limit`) isolates critical work, preventing a single request from starving others.  
+6. **Structured Logging** with Pino captures request IDs, latencies, and error contexts for later analysis.  
+
+All of these pieces sit above a type‑safe Prisma layer, ensuring that database interactions are also resilient and observable.
+
+## Core Concepts  
+| Layer | Tool | Purpose |
+|-------|------|---------|
+| **Runtime** | Node.js ≥ 18 (LTS) | Native ES‑modules, stable performance, long‑term support. |
+| **Typing** | TypeScript 5.x | Compile‑time safety, IDE autocomplete, refactor confidence. |
+| **Framework** | Fastify | Low‑latency request handling, built‑in schema validation, plugin architecture. |
+| **Security** | `@fastify/helmet`, CORS | HTTP headers, CORS policy, defense against common web attacks. |
+| **Validation** | Zod + Fastify schema | Declarative shape definitions, runtime checks, reusable validators. |
+| **Persistence** | Prisma v5 | Type‑safe query builder, migration engine, excellent PostgreSQL integration. |
+| **Logging** | Pino + pino‑http | Structured JSON logs, request‑id correlation, minimal CPU overhead. |
+| **Resilience** | `opossum` (circuit‑breaker), `p-limit` (bulkhead), `async-retry` (retry), `fastify-rate-limit` | Battle‑tested, tiny bundles, easy configuration. |
+| **Observability** | Prometheus client, OpenTelemetry (optional) | Custom metrics, distributed tracing, alerting integration. |
+| **Testing** | Jest, ts‑jest, supertest | Unit, integration, and contract tests with fast execution. |
+| **CI/CD** | GitHub Actions (lint → test → build → docker push) | Automated quality gates and container publishing. |
+| **Containerization** | Docker multi‑stage | Small final image, reproducible builds. |
+
+Each layer is loosely coupled; you can swap Fastify for Express or Prisma for raw queries without rewriting the resilience wrappers.
+
+## Examples & Code Walkthrough  
+Below is a minimal but complete API that follows the architecture described. All snippets are ready to paste into a fresh repository (`mkdir resilient-api && cd resilient-api`).
+
+### 1. `package.json` (excerpt)  
+```json
+{
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "fastify": "^4.24.3",
+    "fastify-cors": "^3.0.3",
+    "fastify-helmet": "^7.0.0",
+    "pino-http": "^9.0.1",
+    "prisma": "^5.10.2",
+    "@prisma/client": "^5.10.2",
+    "zod": "^3.22.4",
+    "opossum": "^7.1.1",
+    "p-limit": "^5.0.0",
+    "async-retry": "^3.2.0",
+    "fastify-rate-limit": "^9.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "@types/node": "^20.11.20",
+    "ts-node": "^10.9.2",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "supertest": "^6.3.4",
+    "@types/jest": "^29.5.12"
+  }
+}
+```
+
+### 2. `src/server.ts` – entry point with graceful shutdown and error handling  
+```ts
+import Fastify, { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
+import pinoHttp from 'pino-http';
+import { registerRoutes } from './routes/index.js';
+import { errorHandler } from './middleware/errorHandler.js';
+import { healthCheck } from './controllers/health.js';
+import { gracefulShutdown } from './utils/gracefulShutdown.js';
+
+const server: FastifyInstance = Fastify({ logger: false });
+
+// security & cross‑origin plugins
+await server.register(cors, { origin: true });
+await server.register(helmet);
+
+// structured logging with request id
+await server.register(pinoHttp, {
+  logger: {
+    level: process.env.LOG_LEVEL ?? 'info',
+    // enable pretty printing in dev only
+    transport:
+      process.env.NODE_ENV === 'development'
+        ? { target: 'pino-pretty' }
+        : undefined,
+  },
+});
+
+// health endpoint
+server.get('/health', healthCheck);
+
+// mount application routes
+await registerRoutes(server);
+
+// central error serializer – RFC‑7807 Problem Details
+server.setErrorHandler(errorHandler);
+
+const start = async () => {
+  try {
+    const port = Number(process.env.PORT ?? 4000);
+    await server.listen({ port, host: '0.0.0.0' });
+    server.log.info(`API listening on ${server.server.address()}`);
+  } catch (err) {
+    server.log.error(err);
+    process.exit(1);
+  }
+};
+
+start().then(() => {
+  // attach termination listeners
+  process.on('SIGTERM', () => gracefulShutdown(server));
+  process.on('SIGINT',  () => gracefulShutdown(server));
+});
+```
+
+### 3. `src/middleware/errorHandler.ts`  
+```ts
+import { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
+import { StatusCodes } from 'http-status-codes';
+
+export interface ProblemDetails {
+  type: string;
+  title: string;
+  status: number;
+  detail?: string;
+  instance?: string;
+}
+
+export const errorHandler = (
+  this: FastifyInstance,
+  error: FastifyError,
+  _request: FastifyRequest,
+  reply: FastifyReply
+) => {
+  const problem: ProblemDetails = {
+    type: '/problems/internal',
+    title: 'Internal Server Error',
+    status: StatusCodes.INTERNAL_SERVER_ERROR,
+    detail: error.message,
+    instance: _request.url,
+  };
+
+  // log the full error for debugging
+  this.log.error({ err: error }, 'request processing failed');
+
+  // expose a sanitized version to the client
+  reply.status(problem.status).send(problem);
+};
+```
+
+### 4. `src/controllers/health.ts`  
+```ts
+import { FastifyRequest, FastifyReply } from 'fastify';
+
+export const healthCheck = async (_: FastifyRequest, reply: FastifyReply) => {
+  // simple DB ping using Prisma (see prisma client import below)
+  // this example uses a generic import – adjust to your Prisma client path
+  const { prisma } = await import('../prisma/client.js');
+
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    reply.send({ status: 'ok', timestamp: new Date().toISOString() });
+  } catch (e) {
+    reply.status(503).send({ status: 'error', reason: 'database unreachable' });
+  }
+};
+```
+
+### 5. `src/prisma/client.ts` – Prisma client with connection pooling  
+```ts
+import { PrismaClient } from '@prisma/client';
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __prisma: PrismaClient | undefined;
+}
+
+export const prisma =
+  globalThis.__prisma ??
+  new PrismaClient({
+    log: process.env.NODE_ENV === 'development'
+      ? ['query', 'error', 'warn']
+      : ['error'],
+    datasources: {
+      db: { url: process.env.DATABASE_URL },
+    },
+  });
+
+if (process.env.NODE_ENV !== 'production') {
+  globalThis.__prisma = prisma;
+}
+```
+
+### 6. `src/routes/users.ts` – a typical CRUD endpoint wrapped with resilience  
+```ts
+import { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { prisma } from '../prisma/client.js';
+import retry from 'async-retry';
+import { CircuitBreaker } from 'opossum';
+import pLimit from 'p-limit';
+import { StatusCodes } from 'http-status-codes';
+
+const userSchema = z.object({
+  name: z.string().min(1),
+  email: z.string().email(),
+});
+
+const limit = pLimit(10); // bulkhead – max 10 concurrent DB writes
+
+// circuit breaker for external email verification service
+const breaker = new CircuitBreaker(async (email: string) => {
+  // simulate external call – replace with real HTTP request
+  const resp = await fetch(`https://example.com/verify?email=${encodeURIComponent(email)}`);
+  if (!resp.ok) throw new Error('verification failed');
+  return resp.json();
+}, {
+  timeout: 5000,
+  errorThresholdPercentage: 50,
+  resetTimeout: 30_000,
+});
+
+export const userRoutes = async (fastify: FastifyInstance) => {
+  // POST /users
+  fastify.post(
+    '/users',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            email: { type: 'string', format: 'email' },
+          },
+          required: ['name', 'email'],
+        },
+      },
+    },
+    async (request, reply) => {
+      const payload = userSchema.parse(request.body);
+
+      // bulkhead – run DB write inside limited slot
+      return limit(async () => {
+        // retry wrapper for transient DB errors
+        return retry(
+          async () => {
+            // attempt to create user
+            const user = await prisma.user.create({
+              data: payload,
+            });
+
+            // optional external verification guarded by circuit breaker
+            try {
+              await breaker.fire(payload.email);
+            } catch (err) {
+              fastify.log.warn({ email: payload.email }, 'verification step failed – continuing');
+            }
+
+            return user;
+          },
+          {
+            retries: 2,
+            factor: 2,
+            minTimeout: 100,
+            maxTimeout: 1000,
+          }
+        );
+      });
+    }
+  );
+
+  // GET /users/:id
+  fastify.get(
+    '/users/:id',
+    {
+      schema: {
+        params: {
+          type: 'object',
+          properties: { id: { type: 'string' } },
+          required: ['id'],
+        },
+      },
+    },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const user = await prisma.user.findUnique({ where: { id } });
+      if (!user) {
+        reply.status(StatusCodes.NOT_FOUND).send({
+          type: '/problems/not-found',
+          title: 'User not found',
+          status: StatusCodes.NOT_FOUND,
+          instance: request.url,
+        });
+        return;
+      }
+      reply.send(user);
+    }
+  );
+};
+```
+
+### 7. `src/routes/index.ts` – route registration  
+```ts
+import { FastifyInstance } from 'fastify';
+import { userRoutes } from './users.js';
+
+export const registerRoutes = async (fastify: FastifyInstance) => {
+  await fastify.register(userRoutes);
+};
+```
+
+### 8. `src/utils/gracefulShutdown.ts`  
+```ts
+import { FastifyInstance } from 'fastify';
+import { prisma } from '../prisma/client.js';
+
+export const gracefulShutdown = async (server: FastifyInstance) => {
+  server.log.info('gracefulShutdown – closing HTTP server');
+  // stop accepting new connections
+  await server.close();
+
+  // release DB connections
+  await prisma.$disconnect();
+
+  server.log.info('gracefulShutdown – finished');
+  process.exit(0);
+};
+```
+
+### 9. `prisma/schema.prisma` – simple user model  
+```prisma
+model User {
+  id    String   @id @default(cuid())
+  name  String
+  email String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+```
+
+### 10. `.env` (example)  
+```
+DATABASE_URL=postgresql://postgres:secret@localhost:5432/resilient_api
+PORT=4000
+LOG_LEVEL=

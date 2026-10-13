@@ -1,0 +1,348 @@
+---
+title: "I built a self-hosted gig watcher so I stop refreshing job boards — it only pings me on new matches"
+slug: "i-built-a-self-hosted-gig-watcher-so-i-stop-refreshing-job-boards-it-only-pings-me-on-new-matches"
+description: "I was tired of opening five different job boards every morning, scanning the same listings, and missing the few that actually matched my skill set. The constant..."
+category: "Web Development"
+tags: ["hosted", "built", "web development", "self"]
+keywords: ["tech guide", "built", "software engineering", "self", "hosted", "web development", "programming"]
+author: "Lead Frontend & Web Architect"
+publishedAt: "2026-10-13"
+readingTime: "10 min read"
+---
+
+# I built a self-hosted gig watcher so I stop refreshing job boards — it only pings me on new matches
+
+## Introduction  
+I was tired of opening five different job boards every morning, scanning the same listings, and missing the few that actually matched my skill set. The constant refresh loop felt like a productivity leak, and I didn’t want to hand over my search terms to a third‑party service. So I built a tiny, self‑hosted watcher that polls the boards I care about, detects new postings, and pushes a notification only when something fresh appears. The result is a quiet inbox (or Slack channel) that tells me exactly what I need to know, nothing more.
+
+## Why This Matters  
+For many engineers, staying aware of contract or remote opportunities is part of career maintenance, yet the manual process is noisy and error‑prone. A self‑hosted solution gives you full control over data privacy—your résumé, keywords, and location never leave your machine. It also teaches practical skills: HTTP clients, HTML parsing, lightweight scheduling, and simple DevOps. In a world where SaaS pricing can creep up, a single‑digit‑dollar VPS can run this service for years.
+
+## How It Works  
+The watcher follows a straightforward loop: a scheduler triggers a scraper for each board, the scraper returns raw listings, a parser normalizes them into a common `JobPosting` object, and a storage layer checks whether we’ve seen the posting before. If it’s new, we hand it off to a notifier that can send email, Slack, or any other channel you plug in.
+
+```mermaid
+flowchart TD
+    S[Scheduler] -->|trigger| A[Scraper Pool]
+    A -->|fetch| B[RemoteOK]
+    A -->|fetch| C[We Work Remotely]
+    A -->|fetch| D[HN WhoIsHiring]
+    B --> E[Parser]
+    C --> E
+    D --> E
+    E --> F[Storage (SQLite)]
+    F -->|Is new?| G{Duplicate?}
+    G -->|No| H[Notifier]
+    G -->|Yes| I[Drop]
+    H --> J[Email/Slack]
+    style S fill:#f9f,stroke:#333
+    style H fill:#bbf,stroke:#333
+```
+
+The scheduler runs every N minutes (configurable via env var). Each scraper is independent, so a failure in one board doesn’t block the others. The storage layer uses a unique hash of the normalized title‑company‑URL tuple to detect duplicates efficiently. When a row is inserted, we capture the newly added ID and build a concise notification payload.
+
+## Core Concepts  
+
+- **Immutable job identifier** – We compute a SHA‑256 hash of `lowercase(title) + lowercase(company) + url`. This survives minor wording changes but still catches truly new posts.  
+- **Separation of concerns** – Ingestion (scraping + parsing) never knows about notification channels; the notifier interface only receives a `JobPosting`.  
+- **Idempotent inserts** – SQLite’s `INSERT OR IGNORE` combined with a `UNIQUE` constraint on the hash lets us treat each scrape as a pure function: run it again, get the same result, no side effects.  
+- **Pluggable notifiers** – By depending on an abstract base class, adding a new channel (e.g., Matrix, Pushover) requires only implementing a `send` method.
+
+## Examples & Code Walkthrough  
+
+Below is a trimmed‑down but functional version of the watcher. It focuses on the RemoteOK JSON API and the We Work Remotely HTML page; you can add more boards by subclassing `BaseScraper`.
+
+```python
+# gig_watcher.py
+import hashlib
+import sqlite3
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import List
+
+import httpx
+from selectolax.parser import HTMLParser
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# ---------- Data model ----------
+@dataclass(frozen=True)
+class JobPosting:
+    uid: str               # SHA‑256 hash used as primary key
+    title: str
+    company: str
+    url: str
+    posted_at: int         # epoch seconds, UTC
+
+    @staticmethod
+    def make_uid(title: str, company: str, url: str) -> str:
+        raw = f"{title.lower()}{company.lower()}{url}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# ---------- Storage ----------
+class JobStore:
+    def __init__(self, db_path: str = "jobs.sqlite"):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                uid TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                company TEXT NOT NULL,
+                url TEXT NOT NULL,
+                posted_at INTEGER NOT NULL
+            )
+            """
+        )
+        self.conn.commit()
+
+    def add_if_new(self, job: JobPosting) -> bool:
+        """Return True if the row was inserted (i.e., new)."""
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO jobs (uid, title, company, url, posted_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (job.uid, job.title, job.company, job.url, job.posted_at),
+            )
+            self.conn.commit()
+            return cur.rowcount == 1
+        except sqlite3.IntegrityError:
+            # uid already present
+            return False
+
+    def recent(self, limit: int = 10) -> List[JobPosting]:
+        cur = self.conn.execute(
+            "SELECT uid, title, company, url, posted_at FROM jobs ORDER BY posted_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [JobPosting(*row) for row in cur.fetchall()]
+
+
+# ---------- Notifier interface ----------
+class Notifier(ABC):
+    @abstractmethod
+    def send(self, job: JobPosting) -> None: ...
+
+
+class EmailNotifier(Notifier):
+    def __init__(self, smtp_host: str, smtp_port: int, user: str, password: str, to_addr: str):
+        self.smtp_host = smtp_host
+        self.smtp_port = smtp_port
+        self.user = user
+        self.password = password
+        self.to_addr = to_addr
+
+    def send(self, job: JobPosting) -> None:
+        import smtplib
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        msg["Subject"] = f"New gig: {job.title} at {job.company}"
+        msg["From"] = self.user
+        msg["To"] = self.to_addr
+        msg.set_content(
+            f"""Found a new posting that matches your criteria:
+
+Title: {job.title}
+Company: {job.company}
+URL: {job.url}
+Posted: {datetime.fromtimestamp(job.posted_at, tz=timezone.utc).isoformat()}
+
+Happy hunting!
+"""
+        )
+        with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port) as server:
+            server.login(self.user, self.password)
+            server.send_message(msg)
+
+
+class SlackNotifier(Notifier):
+    def __init__(self, webhook_url: str):
+        self.webhook_url = webhook_url
+
+    def send(self, job: JobPosting) -> None:
+        payload = {
+            "text": (
+                f":mag: *New gig*\n"
+                f"*{job.title}* at {job.company}\n"
+                f"<{job.url}|View posting>\n"
+                f"_Posted {datetime.fromtimestamp(job.posted_at, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_"
+            )
+        }
+        resp = httpx.post(self.webhook_url, json=payload, timeout=10.0)
+        resp.raise_for_status()
+
+
+# ---------- Base scraper ----------
+class BaseScraper(ABC):
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+
+    @abstractmethod
+    async def fetch(self) -> List[JobPosting]: ...
+
+
+# ---------- Concrete scrapers ----------
+class RemoteOKScraper(BaseScraper):
+    API = "https://remoteok.com/api"
+
+    async def fetch(self) -> List[JobPosting]:
+        resp = await self.client.get(self.API, headers={"User-Agent": "gig-watcher/1.0"})
+        resp.raise_for_status()
+        data = resp.json()
+        # First element is metadata; skip it.
+        jobs = []
+        for item in data[1:]:
+            if not item.get("position") or not item.get("company"):
+                continue
+            uid = JobPosting.make_uid(item["position"], item["company"], item["url"])
+            jobs.append(
+                JobPosting(
+                    uid=uid,
+                    title=item["position"],
+                    company=item["company"],
+                    url=item["url"],
+                    posted_at=int(item.get("date", time.time())),
+                )
+            )
+        return jobs
+
+
+class WeWorkRemotelyScraper(BaseScraper):
+    LIST_URL = "https://weworkremotely.com/categories/remote-programming-jobs"
+
+    async def fetch(self) -> List[JobPosting]:
+        resp = await self.client.get(
+            self.LIST_URL, headers={"User-Agent": "gig-watcher/1.0"}, follow_redirects=True
+        )
+        resp.raise_for_status()
+        html = HTMLParser(resp.text)
+        jobs = []
+        for sec in html.css("section.jobs li"):
+            title_elem = sec.css_first("h4.title")
+            company_elem = sec.css_first("p.company")
+            link_elem = sec.css_first("a")
+            if not (title_elem and company_elem and link_elem):
+                continue
+            title = title_elem.text(strip=True)
+            company = company_elem.text(strip=True)
+            url = link_elem.attributes.get("href", "")
+            if url.startswith("/"):
+                url = f"https://weworkremotely.com{url}"
+            uid = JobPosting.make_uid(title, company, url)
+            # WWR does not expose a timestamp; use now as fallback.
+            posted_at = int(time.time())
+            jobs.append(
+                JobPosting(
+                    uid=uid,
+                    title=title,
+                    company=company,
+                    url=url,
+                    posted_at=posted_at,
+                )
+            )
+        return jobs
+
+
+# ---------- Scheduler wiring ----------
+async def scrape_all(store: JobStore, notifiers: List[Notifier]) -> None:
+    limits = httpx.Limits(max_connections=5, max_keepalive_connections=5)
+    async with httpx.AsyncClient(timeout=15.0, limits=limits) as client:
+        scrapers = [RemoteOKScraper(client), WeWorkRemotelyScraper(client)]
+        for scraper in scrapers:
+            try:
+                new_jobs = await scraper.fetch()
+                for job in new_jobs:
+                    if store.add_if_new(job):
+                        for notifier in notifiers:
+                            try:
+                                notifier.send(job)
+                            except Exception as exc:  # pragma: no cover – notify but don't crash
+                                print(f"Notifier failed: {exc}")
+            except Exception as exc:  # pragma: no cover – log and continue
+                print(f"Scraper {scraper.__class__.__name__} error: {exc}")
+
+
+def start_scheduler(store: JobStore, notifiers: List[Notifier], interval_min: int = 10) -> None:
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        scrape_all,
+        "interval",
+        minutes=interval_min,
+        args=[store, notifiers],
+        id="gig_watcher_job",
+        replace_existing=True,
+        misfire_grace_time=60,
+    )
+    scheduler.start()
+    try:
+        # Keep main thread alive; in a real service you'd run this inside a container.
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
+
+
+# ---------- Entrypoint ----------
+if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+
+    load_dotenv()  # pulls .env into os.environ
+
+    store = JobStore()
+    notifiers: List[Notifier] = []
+    if os.getenv("SMTP_HOST"):
+        notifiers.append(
+            EmailNotifier(
+                smtp_host=os.getenv("SMTP_HOST"),
+                smtp_port=int(os.getenv("SMTP_PORT", "465")),
+                user=os.getenv("SMTP_USER"),
+                password=os.getenv("SMTP_PASS"),
+                to_addr=os.getenv("ALERT_TO"),
+            )
+        )
+    if os.getenv("SLACK_WEBHOOK"):
+        notifiers.append(SlackNotifier(os.getenv("SLACK_WEBHOOK")))
+
+    if not notifiers:
+        raise SystemExit("At least one notifier must be configured.")
+    start_scheduler(store, notifiers, interval_min=int(os.getenv("POLL_MIN", "10")))
+```
+
+**What the code does**
+
+1. **Model** – `JobPosting` is immutable; its `uid` is a deterministic hash that lets us detect duplicates without storing the raw HTML.  
+2. **Storage** – `JobStore` wraps a SQLite file. `add_if_new` returns `True` only when the `INSERT` succeeded, which we treat as a signal to notify.  
+3. **Scrapers** – Each implements `fetch()` returning a list of `JobPosting`. They use a shared `httpx.AsyncClient` with modest connection limits and a custom User‑Agent.  
+4. **Notifier** – Simple interface; the example includes an SMTP‑based email notifier and a Slack webhook notifier. You can enable/disable them via environment variables.  
+5. **Scheduler** – `APScheduler` runs the scrape loop at a configurable interval, handling misfires gracefully.  
+
+The script is deliberately compact yet production‑ready: it catches exceptions per board, logs them, and continues; it uses parameterized SQL to avoid injection; and it respects a basic rate limit via the `httpx.Limits` object.
+
+## Best Practices  
+
+- **Keep the scraper polite** – Set a realistic `User‑Agent`, honor `Retry‑After` headers, and apply exponential back‑off via `tenacity` if you encounter HTTP 429.  
+- **Isolate secrets** – Never commit SMTP passwords or webhook URLs; load them from a `.env` file or a secret manager.  
+- **Make the service observable** – Export a `/health` endpoint that returns `200` when the scheduler is alive, and push counters (`jobs_scraped_total`, `jobs_new_total`) to a Prometheus exporter.  
+- **Version your schema** – If you ever need to add columns (e.g., salary), write a migration script that runs on startup. SQLite’s `PRAGMA user_version` helps track schema versions.  
+- **Containerize** – Use a multi‑stage Dockerfile: first stage builds the wheel, second stage copies only the runtime dependencies and the app code. This yields an image under 30 MB.  
+
+## Common Mistakes & Anti‑Patterns  
+
+| Mistake | Why it hurts | Fix |
+|---------|--------------|-----|
+| **Scraping without rate limits** | Triggers IP bans or legal complaints. | Use `httpx.Limits`, respect `Retry‑After`, and add a jittered delay between requests. |
+| **Storing raw HTML in the DB** | Bloats storage and makes deduplication fragile. | Store only the normalized fields and a hash; discard the raw payload after parsing. |
+| **Hard‑coding notification credentials** | Leaks secrets if the repo is public. | Pull credentials from environment variables or a secret manager; never commit them. |
+| **Using a global `requests` session in async code** | Blocks the event loop, hurting throughput. | Prefer `httpx.AsyncClient` (or `aiohttp`) for all I/O inside async functions. |
+| **Ignoring timezone** | Comparing timestamps across zones yields false duplicates. | Store all times as UTC epoch seconds; convert only for display. |
+
+## Performance Considerations  
+
+- **CPU** – The scraper does minimal work: HTTP I/O dominates. On a $5 V

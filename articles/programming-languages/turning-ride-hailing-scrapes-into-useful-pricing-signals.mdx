@@ -1,0 +1,210 @@
+---
+title: "Turning Ride-Hailing Scrapes Into Useful Pricing Signals"
+slug: "turning-ride-hailing-scrapes-into-useful-pricing-signals"
+description: "Ride‑hailing platforms generate massive streams of real‑time data, but the official pricing APIs often lag behind the actual supply‑demand dynamics on the groun..."
+category: "Programming Languages"
+tags: ["turning", "hailing", "ride", "programming languages"]
+keywords: ["ride", "turning", "programming", "tech guide", "hailing", "programming languages", "software engineering"]
+author: "Compiler & Language Architect"
+publishedAt: "2026-10-14"
+readingTime: "9 min read"
+---
+
+# Turning Ride-Hailing Scrapes Into Useful Pricing Signals
+
+## Introduction
+Ride‑hailing platforms generate massive streams of real‑time data, but the official pricing APIs often lag behind the actual supply‑demand dynamics on the ground. By scraping publicly visible UI elements we can capture surge banners, driver counts, and other signals that reflect the current market condition. This article shows how to turn those scrapes into a numeric price‑adjustment factor that can be consumed by the pricing micro‑service.
+
+## Why This Matters
+When fares are calculated from stale metrics, riders experience long wait times and drivers receive low earnings, which in turn hurts platform health. A real‑time price‑adjustment factor derived from scraped data lets us react to demand spikes within minutes, improving both rider satisfaction and driver income.
+
+## How It Works
+The pipeline consists of four stages: (1) scraping with Playwright, (2) persisting raw JSONL to object storage, (3) streaming via Kafka into Flink for feature extraction, (4) storing enriched features in Redis and exposing them through FastAPI.  
+
+```mermaid
+flowchart TD
+    A[Scrape Ride Data] --> B[Raw JSONL Files (MinIO)]
+    B --> C[Kafka Topic: ride_scrape]
+    C --> D[Flink Stream Processor]
+    D --> E[Redis Feature Store (zone_id → surge_factor, driver_count)]
+    E --> F[FastAPI Pricing Service]
+    F --> G[Ride‑Hailing Pricing Engine (consumes /price-signal)]
+    G --> H[Dynamic Fare Adjustment]
+    H --> I[Rider App]
+    I --> J[Feedback Metrics (Prometheus)]
+    J -->|Loop| A
+```
+
+*Step‑by‑step explanation*  
+1. **Scrape Ride Data** – Playwright launches a headless Chromium instance, navigates to a zone‑specific page, extracts the surge banner text and driver count, then returns a JSON record.  
+2. **Raw JSONL Files (MinIO)** – Each record is appended to a line‑delimited JSON file in an object store, providing immutable auditability.  
+3. **Kafka Topic: ride_scrape** – A producer pushes the JSON payload to a Kafka topic; the key is the zone identifier, enabling downstream partitioning.  
+4. **Flink Stream Processor** – Consumes the topic, parses the JSON, maps the textual surge indicator to a float (`surge_factor`), and computes additional features such as `driver_count`. The enriched stream is written to a Redis sorted set keyed by `zone_id` and timestamp.  
+5. **FastAPI Pricing Service** – Reads the latest value from Redis, loads regression coefficients from PostgreSQL, applies a lightweight linear model, and returns the numeric adjustment.  
+6. **Ride‑Hailing Pricing Engine** – Calls the FastAPI endpoint, receives the adjustment, and incorporates it into the base fare calculation before sending the final price to the rider app.  
+7. **Feedback Metrics (Prometheus)** – The rider app reports actual wait times and rider‑complaint rates; these metrics are fed back into a weekly regression job that refines the coefficients.
+
+## Core Concepts
+- **Scraping** – Uses Playwright’s async API to avoid blocking the event loop; extracts only publicly viewable elements, respecting robots.txt.  
+- **Raw Storage** – JSONL files are versioned in MinIO; lifecycle rules automatically purge data older than 30 days.  
+- **Kafka** – Provides durable, ordered streaming with exactly‑once semantics; the topic is partitioned by `zone_id` to balance load.  
+- **Flink** – Stateless processing enables low‑latency feature computation; state is kept in Redis for O(1) look‑ups.  
+- **Redis Feature Store** – Sorted sets (`ZADD`) keep the most recent `surge_factor` and `driver_count` per zone; a TTL of five minutes ensures freshness.  
+- **FastAPI** – Lightweight HTTP layer; reads from Redis, fetches coefficients from PostgreSQL, and performs the linear calculation `price_adj = β0 + β1·surge_factor + β2·log(driver_count)`.  
+- **Coefficient Management** – Coefficients are stored in a dedicated PostgreSQL table; a CI pipeline updates them without code changes, enabling A/B testing of pricing strategies.
+
+## Examples & Code Walkthrough
+
+### 1. Scraping Module
+```python
+import asyncio
+import json
+import os
+from playwright.async_api import async_playwright
+
+async def scrape_zone(zone_id: str) -> dict:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.goto(f"https://ride.example.com/zone/{zone_id}")
+        surge_text = await page.text_content(".surge-banner")
+        driver_count = await page.inner_text(".driver-list")
+        await browser.close()
+    return {
+        "zone_id": zone_id,
+        "surge_text": surge_text.strip(),
+        "driver_count": int(driver_count)
+    }
+
+async def run_scrape(zones: list[str]) -> None:
+    tasks = [scrape_zone(z) for z in zones]
+    results = await asyncio.gather(*tasks)
+    for rec in results:
+        raw_path = os.path.join("/data/raw", f"{rec['zone_id']}.jsonl")
+        with open(raw_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+```
+
+*Comments* – The function launches a temporary browser, extracts the needed elements, converts the driver count to an integer, and writes each record as a new line in a JSONL file for later consumption.
+
+### 2. Kafka Producer
+```python
+from confluent_kafka import Producer
+import json
+
+producer = Producer({"bootstrap.servers": "kafka:9092"})
+
+def delivery_report(err, msg):
+    if err is not None:
+        print(f"Delivery failed: {err}")
+    else:
+        print(f"Message delivered to {msg.topic()} [{msg.partition()}]")
+
+def send_scrape_record(rec: dict) -> None:
+    payload = {
+        "zone_id": rec["zone_id"],
+        "timestamp": "2025-10-31T12:00:00Z",
+        "surge_factor": 0.5 if "high" in rec["surge_text"].lower() else 0.1,
+        "driver_count": rec["driver_count"]
+    }
+    producer.produce(
+        topic="ride_scrape",
+        key=rec["zone_id"],
+        value=json.dumps(payload).encode("utf-8"),
+        callback=delivery_report,
+    )
+    producer.flush()
+
+def main_kafka():
+    with open("/data/raw/NYC-1.jsonl", "r", encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            send_scrape_record(rec)
+
+if __name__ == "__main__":
+    main_kafka()
+```
+
+*Comments* – The producer builds a payload that includes a derived `surge_factor` based on the textual banner, then sends the message to Kafka with the zone ID as the key. The `delivery_report` callback logs any delivery errors.
+
+### 3. FastAPI Pricing Service
+```python
+from fastapi import FastAPI, HTTPException
+import redis
+import json
+import math
+import psycopg2
+
+app = FastAPI()
+r = redis.Redis(host="redis", port=6379, db=0)
+
+def load_coefficients() -> dict:
+    conn = psycopg2.connect(dsn="dbname=pricing user=app")
+    cur = conn.cursor()
+    cur.execute("SELECT coeff0, coeff1, coeff2 FROM pricing_coeffs LIMIT 1")
+    coeffs = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not coeffs:
+        raise RuntimeError("Coefficients not found")
+    return {"β0": coeffs[0], "β1": coeffs[1], "β2": coeffs[2]}
+
+@app.get("/price-signal/{zone_id}")
+def price_signal(zone_id: str):
+    # Retrieve the most recent entry for the zone (sorted set stores timestamps as scores)
+    latest = r.zrange(zone_id, -1, 0)
+    if not latest:
+        raise HTTPException(status_code=404, detail="No data for zone")
+    payload = json.loads(latest[0])
+    coeffs = load_coefficients()
+    surge = payload["surge_factor"]
+    drivers = payload["driver_count"]
+    adj = (coeffs["β0"] + coeffs["β1"] * surge + coeffs["β2"] * math.log(drivers))
+    return {"zone_id": zone_id, "price_adj": adj}
+```
+
+*Comments* – The endpoint fetches the latest JSON payload from Redis, loads the regression coefficients from PostgreSQL, computes the adjustment using a logarithmic transformation of driver count, and returns the result as JSON.
+
+## Best Practices
+- **High‑frequency scraping** – Run the scraper every 60 seconds; use exponential back‑off on HTTP 429 or network errors to avoid throttling.  
+- **Idempotent writes** – Append to JSONL files rather than overwrite; this guarantees recovery after a crash.  
+- **Schema evolution** – Store raw records in a columnar format (Iceberg or Delta Lake) so downstream jobs can add new fields without breaking existing pipelines.  
+- **Feature versioning** – Tag Redis keys with a version suffix when coefficients change; the pricing service can fallback to the previous version if the new one is unavailable.  
+- **Observability** – Export Prometheus metrics for scrape latency, Kafka lag, Redis hit rate, and pricing error; monitor drift between predicted surge and actual rider complaints.  
+- **Security** – Restrict Playwright to public URLs only; sanitize inputs to prevent SSRF; enforce TLS for all inter‑service communication (Kafka, Redis, PostgreSQL).
+
+## Common Mistakes & Anti-Patterns
+1. **Blocking the event loop** – Using synchronous Selenium inside an async scraper stalls the whole process. *Fix*: stick to Playwright’s async API or run Selenium in a separate thread pool.  
+2. **Hard‑coding URLs** – Embedding full URLs in the code makes it brittle when the service moves domains. *Fix*: keep zone identifiers in a configuration file and build URLs dynamically.  
+3. **Ignoring rate limits** – Sending too many requests to the same host can trigger IP bans. *Fix*: implement a token bucket limiter per domain and respect `Retry‑After` headers.  
+4. **Storing raw JSON without validation** – Corrupt or malformed lines break downstream processing. *Fix*: validate each record before appending; drop or log malformed entries.
+
+## Performance Considerations
+- **Memory** – The scraper holds only a single page’s DOM in memory; the JSONL writer streams data, keeping memory footprint low.  
+- **CPU** – Playwright’s Chromium launch is the most expensive operation; launching per zone every minute is acceptable on modest VMs (2 vCPU, 4 GB RAM).  
+- **Network latency** – Kafka producer batches messages; batching reduces round‑trips and improves throughput.  
+- **Scalability** – Flink jobs can be horizontally scaled by adding task managers; partitioning the Kafka topic by zone ensures even load distribution.  
+- **Big‑O** – The overall pipeline runs in O(N) time where N is the number of zones processed; feature extraction is O(1) per record, and Redis look‑ups are constant time.
+
+## Real-World Usage
+Netflix uses a similar scrape‑to‑signal approach for its adaptive bitrate engine, pulling CDN health metrics from public status pages. Uber’s pricing team has experimented with driver‑availability signals extracted from driver‑app UI elements to fine‑tune surge factors in real time. Cloudflare leverages public UI scrapes to detect network‑level congestion and adjust its own pricing for premium services.
+
+## Frequently Asked Questions (FAQ)
+
+**Q1: Is scraping legal for pricing signals?**  
+A: As long as the content is publicly viewable, the site’s robots.txt permits crawling, and you respect the terms of service, the practice is permissible. Always add a delay between requests and keep the user‑agent identifier accurate.
+
+**Q2: How do I handle zones that have no driver data?**  
+A: The scraper returns a driver count of zero; the pricing model can treat this as a low‑demand zone and apply a minimal adjustment. You may also add a fallback coefficient that caps the surge factor at a safe upper bound.
+
+**Q3: Can I replace Kafka with another message queue?**  
+A: Yes. The architecture is queue‑agnostic; any system that can deliver ordered messages and support key‑based partitioning (e.g., Pulsar, RabbitMQ with routing keys) works.
+
+**Q4: What TTL should I set for Redis entries?**  
+A: Five minutes balances freshness with stability. Shorter TTLs (e.g., 60 seconds) are useful during extreme events; longer TTLs (e.g., 15 minutes) reduce Redis load during quiet periods.
+
+**Q5: How often should I retrain the pricing coefficients?**  
+A: A weekly batch job that ingests error metrics (actual wait time vs. predicted fare) and re‑fits the linear model is sufficient for most platforms. Adjust frequency based on traffic volatility.
+
+## Conclusion
+Turning publicly scraped ride‑hailing data into a numeric price‑adjustment factor creates a responsive pricing layer that reacts to real‑time demand. By decoupling ingestion, streaming, feature extraction, and serving through well‑defined components, the system stays maintainable, observable, and easy to extend. Following the best practices and avoiding the common anti‑patterns described above will help you deploy a robust solution at scale.

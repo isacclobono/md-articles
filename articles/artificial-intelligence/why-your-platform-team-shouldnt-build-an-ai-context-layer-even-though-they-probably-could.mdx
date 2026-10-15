@@ -1,0 +1,402 @@
+---
+title: "Why your platform team shouldn't build an AI context layer (even though they probably could)"
+slug: "why-your-platform-team-shouldnt-build-an-ai-context-layer-even-though-they-probably-could"
+description: "Last quarter, our platform team spent six weeks building what we called the \"Unified Context Service.\" The pitch was clean: a single gRPC endpoint that any serv..."
+category: "Artificial Intelligence"
+tags: ["your", "platform", "artificial intelligence", "team"]
+keywords: ["tech guide", "artificial intelligence", "team", "programming", "platform", "software engineering", "your"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-10-15"
+readingTime: "10 min read"
+---
+
+# Why your platform team shouldn't build an AI context layer (even though they probably could)
+
+## Introduction
+
+Last quarter, our platform team spent six weeks building what we called the "Unified Context Service." The pitch was clean: a single gRPC endpoint that any service in the org could call to fetch relevant context for LLM prompts—documentation, recent tickets, code snippets, schema definitions, you name it. We shipped it. Three teams adopted it. Then the complaints started.
+
+The search team needed semantic ranking with hybrid BM25/vector fusion. The support bot team needed conversation history with sliding-window token budgeting. The code-gen team needed AST-aware repository context with import-graph traversal. Our "unified" API became a kitchen sink of optional parameters, feature flags, and `context_type` enums that nobody could keep straight.
+
+We didn't build a platform. We built a distributed monolith with a single point of failure and a six-month backlog of "just one more context type" requests.
+
+This article is about why that pattern keeps happening, why your platform team will likely fall for it too, and what you should do instead.
+
+## Why This Matters
+
+Every organization adopting LLMs in production hits the same wall: **context assembly is the new data engineering**.
+
+It's not prompt engineering. It's not model selection. It's the unglamorous work of gathering, filtering, ranking, and formatting the right information into a token budget before the model ever sees it. And it varies wildly by use case:
+
+| Use Case | Context Sources | Latency Budget | Ranking Strategy | Freshness Requirement |
+|----------|-----------------|----------------|------------------|----------------------|
+| Support bot | KB articles, past tickets, user profile | < 500ms | Hybrid semantic + keyword | Minutes |
+| Code generation | Repo AST, imports, docs, test patterns | < 2s | Graph traversal + recency | Commits |
+| SQL copilot | Schema, sample queries, lineage | < 1s | Column-level relevance | Hours |
+| Incident resolver | Runbooks, recent deploys, metrics, logs | < 3s | Temporal + causal | Seconds |
+
+A single service trying to serve all of these becomes a **coordination bottleneck**. Every new context type requires platform team capacity. Every ranking tweak requires a platform deploy. Every latency regression blocks three product teams simultaneously.
+
+The platform team *can* build this. They have the infra skills, the Kubernetes clusters, the observability stack. But **capability ≠ suitability**.
+
+## How It Works
+
+The typical "AI Context Layer" architecture looks reasonable on a whiteboard:
+
+```mermaid
+flowchart TB
+    subgraph Clients["Product Teams"]
+        A[Support Bot API]
+        B[Code Gen Service]
+        C[SQL Copilot]
+        D[Incident Resolver]
+    end
+
+    subgraph Platform["Platform Team Ownership"]
+        GW[API Gateway / Auth]
+        CS[Context Service\n(gRPC/REST)]
+        subgraph Pipeline["Context Assembly Pipeline"]
+            F[Fetcher Registry]
+            R[Ranker / Filter]
+            T[Token Budgeter]
+            FMT[Formatter]
+        end
+        subgraph Stores["Backing Stores"]
+            VS[(Vector Store)]
+            KS[(Keyword Index)]
+            GS[(Graph Store)]
+            RS[(Relational DB)]
+        end
+    end
+
+    Clients --> GW --> CS
+    CS --> Pipeline
+    F --> VS & KS & GS & RS
+    Pipeline --> F --> R --> T --> FMT
+    FMT --> CS
+    CS --> Clients
+
+    style Platform fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    style Clients fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+```
+
+**Step-by-step breakdown:**
+
+1. **Client calls context service** with a request: `{ query: "user login failure", context_types: ["kb", "tickets", "schema"], token_budget: 4000 }`
+2. **Fetcher registry** dispatches to registered fetchers based on `context_types`—each fetcher knows how to query its backing store (vector, keyword, graph, SQL)
+3. **Ranker/filter** merges results, applies scoring (semantic similarity, recency, authority), deduplicates, and truncates
+4. **Token budgeter** estimates token counts per chunk, applies sliding-window or priority-based truncation to fit `token_budget`
+5. **Formatter** assembles final context string with citations, metadata, and delimiter tokens
+6. **Response** returns formatted context + provenance metadata to client
+
+The problem isn't the pipeline. The problem is **ownership**.
+
+## Core Concepts
+
+### Context Assembly ≠ Context Storage
+
+Platform teams excel at storage: provisioning vector databases, managing embedding pipelines, running OpenSearch clusters. But **assembly is a product concern**.
+
+Assembly requires:
+- Domain-specific ranking signals (e.g., "prefer tickets closed by senior engineers")
+- Token budgeting strategies that match the downstream model's behavior
+- Formatting conventions that the prompt template expects
+- Freshness guarantees that vary by use case (seconds for incidents, hours for code)
+
+These are **product decisions**, not infrastructure decisions.
+
+### The Fetcher Registry Trap
+
+The fetcher registry pattern—registering plugins for each context type—seems extensible. In practice:
+
+```python
+# platform/context/fetcher_registry.py
+class FetcherRegistry:
+    def __init__(self):
+        self._fetchers: dict[str, ContextFetcher] = {}
+    
+    def register(self, context_type: str, fetcher: ContextFetcher) -> None:
+        if context_type in self._fetchers:
+            raise ValueError(f"Fetcher for {context_type} already registered")
+        self._fetchers[context_type] = fetcher
+    
+    def fetch_all(self, request: ContextRequest) -> list[ContextChunk]:
+        results = []
+        for ctx_type in request.context_types:
+            fetcher = self._fetchers.get(ctx_type)
+            if not fetcher:
+                logger.warning("No fetcher for %s", ctx_type)
+                continue
+            results.extend(fetcher.fetch(request))
+        return results
+```
+
+Every new `context_type` requires:
+1. A new fetcher implementation (platform team writes it, or reviews a PR from a product team)
+2. Registration at startup (platform team deploys)
+3. Integration testing against the full pipeline (platform team owns CI)
+4. Monitoring/alerting for the new fetcher's latency and error rates (platform team maintains)
+
+The platform team becomes a **gatekeeper for product innovation**.
+
+### Token Budgeting Is Model-Specific
+
+A context layer that doesn't know the target model's tokenizer, context window, and attention characteristics will produce suboptimal context.
+
+```python
+# This lives in the platform service today
+class TokenBudgeter:
+    def __init__(self, model_name: str = "gpt-4"):
+        self.encoding = tiktoken.encoding_for_model(model_name)
+    
+    def fit(self, chunks: list[ContextChunk], budget: int) -> list[ContextChunk]:
+        # Naive: truncate lowest-priority chunks first
+        sorted_chunks = sorted(chunks, key=lambda c: c.priority)
+        total = 0
+        result = []
+        for chunk in sorted_chunks:
+            tokens = len(self.encoding.encode(chunk.content))
+            if total + tokens > budget:
+                break
+            result.append(chunk)
+            total += tokens
+        return result
+```
+
+But the code-gen team uses `gpt-4-turbo` (128k context), the support bot uses `claude-3-haiku` (200k), and the SQL copilot uses a fine-tuned `codellama-7b` (4k). The platform service either:
+- Hardcodes one tokenizer (wrong for everyone else)
+- Accepts `model_name` as a parameter (now the platform team tracks model releases)
+- Returns raw chunks and pushes budgeting to clients (defeats the purpose of the service)
+
+## Examples & Code Walkthrough
+
+### The Anti-Pattern: Centralized Context Service
+
+Here's what the platform team typically ships—complete with the technical debt that accumulates:
+
+```python
+# platform/context/service.py
+# WARNING: This is the anti-pattern. Do not copy.
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Protocol
+import asyncio
+import logging
+from abc import abstractmethod
+
+logger = logging.getLogger(__name__)
+
+class ContextType(str, Enum):
+    KB_ARTICLE = "kb_article"
+    TICKET = "ticket"
+    CODE_SNIPPET = "code_snippet"
+    SCHEMA = "schema"
+    RUNBOOK = "runbook"
+    DEPLOY_LOG = "deploy_log"
+    METRIC = "metric"
+    # ... 12 more types added over 6 months
+
+@dataclass
+class ContextChunk:
+    content: str
+    source: str
+    context_type: ContextType
+    score: float
+    metadata: dict = field(default_factory=dict)
+    token_estimate: int = 0
+    priority: int = 0  # Higher = more important
+
+@dataclass
+class ContextRequest:
+    query: str
+    context_types: list[ContextType]
+    token_budget: int = 4000
+    model_name: str = "gpt-4"
+    filters: dict = field(default_factory=dict)  # Became a dumping ground
+    ranking_config: dict = field(default_factory=dict)  # "Just one more knob"
+
+class ContextFetcher(Protocol):
+    @abstractmethod
+    async def fetch(self, request: ContextRequest) -> list[ContextChunk]:
+        ...
+
+class UnifiedContextService:
+    """
+    The 'God Service' that tries to be everything to everyone.
+    """
+    
+    def __init__(
+        self,
+        fetchers: dict[ContextType, ContextFetcher],
+        ranker: "ContextRanker",
+        budgeter: "TokenBudgeter",
+        formatter: "ContextFormatter",
+    ):
+        self._fetchers = fetchers
+        self._ranker = ranker
+        self._budgeter = budgeter
+        self._formatter = formatter
+    
+    async def get_context(self, request: ContextRequest) -> "ContextResponse":
+        # 1. Fan-out to all fetchers (sequential because of shared connection pools)
+        all_chunks: list[ContextChunk] = []
+        for ctx_type in request.context_types:
+            fetcher = self._fetchers.get(ctx_type)
+            if not fetcher:
+                logger.warning("No fetcher registered for %s", ctx_type)
+                continue
+            try:
+                chunks = await asyncio.wait_for(
+                    fetcher.fetch(request),
+                    timeout=2.0  # Hardcoded, causes tail latency
+                )
+                all_chunks.extend(chunks)
+            except asyncio.TimeoutError:
+                logger.error("Fetcher %s timed out", ctx_type)
+                # Silent failure - client gets partial context
+            except Exception as e:
+                logger.exception("Fetcher %s failed: %s", ctx_type, e)
+        
+        # 2. Rank - but ranking config is a free-form dict nobody documents
+        ranked = self._ranker.rank(all_chunks, request.ranking_config)
+        
+        # 3. Budget - uses platform's tokenizer, not client's
+        budgeted = self._budgeter.fit(ranked, request.token_budget)
+        
+        # 4. Format - single format for all clients
+        formatted = self._formatter.format(budgeted)
+        
+        return ContextResponse(
+            context=formatted,
+            chunks=budgeted,
+            total_tokens=sum(c.token_estimate for c in budgeted),
+            truncated=len(budgeted) < len(ranked),
+        )
+```
+
+**What goes wrong in production:**
+
+1. **Connection pool contention**: All fetchers share the platform service's HTTP/grpc pools. A slow KB fetcher starves the code snippet fetcher.
+2. **Silent partial failures**: If the ticket fetcher times out, the client gets context *without tickets* and no indication something's missing.
+3. **Ranking config drift**: `ranking_config` becomes an untyped, undocumented API surface. Product teams pass magic strings; platform team breaks them during refactors.
+4. **Formatter coupling**: The single formatter outputs markdown with `[[citation]]` syntax. The code-gen team needs XML tags. The SQL copilot needs JSON. Platform team adds `format_type` parameter. Now there are three formatters in one class.
+
+### The Alternative: Composable Client-Side Assembly
+
+Instead of a central service, give product teams **building blocks** they compose themselves:
+
+```python
+# platform/context/primitives.py
+# Platform provides: reliable, observable, versioned primitives
+from dataclasses import dataclass
+from typing import AsyncIterator, Protocol
+import asyncio
+
+@dataclass(frozen=True)
+class ContextSource:
+    """Immutable description of a context source."""
+    name: str
+    description: str
+    latency_p50_ms: int
+    latency_p99_ms: int
+    freshness_sla_seconds: int
+    supported_filters: frozenset[str]
+
+class ContextFetcher(Protocol):
+    """Primitive: fetch raw chunks from a single source."""
+    @property
+    def source(self) -> ContextSource: ...
+    
+    async def fetch(
+        self,
+        query: str,
+        *,
+        filters: dict | None = None,
+        limit: int = 50,
+    ) -> AsyncIterator[ContextChunk]:
+        """Stream chunks - client controls backpressure."""
+        ...
+
+class ContextRanker(Protocol):
+    """Primitive: rank chunks with a specific strategy."""
+    async def rank(
+        self,
+        chunks: list[ContextChunk],
+        query: str,
+        config: "RankingConfig",
+    ) -> list[ContextChunk]: ...
+
+class TokenBudgeter(Protocol):
+    """Primitive: fit chunks into a token budget for a specific model."""
+    def fit(
+        self,
+        chunks: list[ContextChunk],
+        budget: int,
+        tokenizer: "Tokenizer",
+    ) -> list[ContextChunk]: ...
+
+class ContextFormatter(Protocol):
+    """Primitive: format chunks for a specific prompt template."""
+    def format(self, chunks: list[ContextChunk]) -> str: ...
+```
+
+**Platform team owns:**
+- `VectorFetcher` (wraps Pinecone/Weaviate/OpenSearch with retries, circuit breakers, metrics)
+- `KeywordFetcher` (wraps Elasticsearch/OpenSearch)
+- `GraphFetcher` (wraps Neo4j/JanusGraph for code graphs)
+- `SqlFetcher` (parameterized queries against read replicas)
+- `BM25Ranker`, `SemanticRanker`, `HybridRanker`, `RecencyRanker`
+- `TiktokenBudgeter`, `HfTokenBudgeter`, `ClaudeTokenBudgeter`
+- `MarkdownFormatter`, `XmlFormatter`, `JsonFormatter`
+
+**Product team composes:**
+
+```python
+# product/support_bot/context_assembler.py
+# Product team owns: assembly logic for THEIR use case
+from platform.context.primitives import (
+    VectorFetcher, KeywordFetcher, HybridRanker,
+    TiktokenBudgeter, MarkdownFormatter, ContextChunk
+)
+from platform.context.sources import SUPPORT_KB_SOURCE, TICKET_SOURCE
+
+class SupportBotContextAssembler:
+    """
+    Assembles context specifically for the support bot.
+    No platform team involvement needed for changes.
+    """
+    
+    def __init__(
+        self,
+        kb_fetcher: VectorFetcher,
+        ticket_fetcher: KeywordFetcher,
+        ranker: HybridRanker,
+        budgeter: TiktokenBudgeter,
+        formatter: MarkdownFormatter,
+    ):
+        self._kb = kb_fetcher
+        self._tickets = ticket_fetcher
+        self._ranker = ranker
+        self._budgeter = budgeter
+        self._formatter = formatter
+    
+    async def assemble(self, user_query: str, user_id: str, token_budget: int = 3500) -> str:
+        # Fetch in parallel - client controls concurrency
+        kb_chunks, ticket_chunks = await asyncio.gather(
+            self._kb.fetch(user_query, filters={"product": "billing"}, limit=20),
+            self._tickets.fetch(user_query, filters={"status": "closed", "assignee_level": "senior+"}, limit=10),
+        )
+        
+        all_chunks = list(kb_chunks) + list(ticket_chunks)
+        
+        # Domain-specific ranking: prefer KB for "how-to", tickets for "error codes"
+        ranking_config = HybridRanker.Config(
+            semantic_weight=0.7 if "how" in user_query.lower() else 0.3,
+            keyword_weight=0.3 if "how" in user_query.lower() else 0.7,
+            recency_boost_hours=168,  # 1 week
+            authority_boost={"kb": 1.2, "ticket": 1.0},
+        )
+        ranked = await self._ranker.rank(all_chunks, user_query, ranking_config)
+        
+        # Model-specific budgeting
+        budgeted = self._budgeter.fit(ranked, token_budget, tokenizer="

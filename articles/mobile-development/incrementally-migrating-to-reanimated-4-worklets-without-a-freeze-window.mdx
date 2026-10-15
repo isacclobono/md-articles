@@ -1,0 +1,404 @@
+---
+title: "Incrementally Migrating to Reanimated 4 Worklets without a Freeze Window"
+slug: "incrementally-migrating-to-reanimated-4-worklets-without-a-freeze-window"
+description: "Reanimated 4 changed the contract between JavaScript and the UI thread. Worklets aren't just \"faster animations\"—they move logic off the JS thread entirely, com..."
+category: "Mobile Development"
+tags: ["migrating", "reanimated", "incrementally", "mobile development"]
+keywords: ["programming", "migrating", "mobile development", "tech guide", "reanimated", "incrementally", "software engineering"]
+author: "Lead Mobile Applications Engineer"
+publishedAt: "2026-10-15"
+readingTime: "10 min read"
+---
+
+# Incrementally Migrating to Reanimated 4 Worklets without a Freeze Window
+
+## Introduction
+
+Reanimated 4 changed the contract between JavaScript and the UI thread. Worklets aren't just "faster animations"—they move logic off the JS thread entirely, compiling to bytecode that executes on the UI runtime. That’s powerful. It’s also dangerous if you flip the switch on a legacy codebase during a single release.
+
+We learned this the hard way. Our first attempt at migrating a gesture-heavy feed screen caused a 400 ms main-thread stall on cold start. The culprit? Synchronous worklet initialization during the first render pass. The UI thread blocked while JSI compiled bytecode for every `useAnimatedGestureHandler` and `withSpring` reference in the tree.
+
+This article walks through the incremental strategy we use to migrate large surfaces without ever introducing a freeze window. No big bang. No feature flags that leak into prod. Just a disciplined, observable rollout.
+
+## Why This Matters
+
+If you're shipping a React Native app with non-trivial interaction—draggable cards, shared element transitions, complex gesture chains—you're already paying the bridge tax. Every `setState` triggered by a gesture handler crosses the bridge. On low-end Android devices, that tax manifests as dropped frames, janky scroll, and ANRs.
+
+Reanimated 4 eliminates that tax *if* the worklet is already compiled and resident on the UI thread. But the compilation step isn't free. V8/Hermes JSI compilation on the UI thread competes with layout, raster, and input handling. If you import a heavy worklet module at the top level of your entry point, you've just added a synchronous tax to every app launch.
+
+The migration strategy matters because:
+- **App Store reviews** punish regressions in startup latency.
+- **Feature flags** that control animation paths create combinatorial test surfaces.
+- **Rollback capability** is non-negotiable when a worklet crashes the UI thread (and it will).
+
+We need a path where the old code keeps running while the new code warms up in the background.
+
+## How It Works
+
+The core insight: **worklet compilation is idempotent and side-effect-free**. You can trigger it any time after the JSI runtime initializes. You don't need it during the first paint. You need it before the first *interaction* that uses it.
+
+We split migration into three independent concerns:
+1. **Discovery** – Static analysis to find worklet candidates.
+2. **Warm-up** – Async compilation on the UI thread after first meaningful paint.
+3. **Cutover** – Per-component switching with a synchronous fallback.
+
+```mermaid
+flowchart TD
+    subgraph "Build Time"
+        A[Static Analysis: grep for useAnimatedGestureHandler, withTiming, withSpring] --> B[Generate Worklet Manifest\nworklets.manifest.json]
+    end
+
+    subgraph "Runtime: Cold Start"
+        C[App Launch] --> D[Render First Frame\nZero Worklet Imports]
+        D --> E[requestIdleCallback / InteractionManager.runAfterInteractions]
+        E --> F[WorkletPreloader.consumeManifest]
+        F --> G[runOnUI: require(workletPath) for each entry]
+        G --> H[Cache Compiled Bytecode\nin WeakMap<WorkletName, Module>]
+    end
+
+    subgraph "Runtime: Interaction"
+        I[User Gesture / Mount Animated Component] --> J{WorkletReady?}
+        J -- Yes --> K[Execute Worklet Path\nUI Thread Only]
+        J -- No --> L[Execute Fallback Path\nJS Thread / Reanimated 3]
+        K --> M[Metrics: worklet.hit]
+        L --> N[Metrics: worklet.miss + latency]
+    end
+
+    subgraph "Observability"
+        M --> O[Datadog / Sentry: worklet.compilation.latency]
+        N --> O
+        O --> P{Error Rate > Threshold?}
+        P -- Yes --> Q[Kill Switch: force fallback globally]
+        P -- No --> R[Gradually Expand Manifest]
+    end
+
+    style A fill:#e8f5e9,stroke:#2e7d32
+    style B fill:#e8f5e9,stroke:#2e7d32
+    style D fill:#fff3e0,stroke:#ef6c00
+    style F fill:#e3f2fd,stroke:#1565c0
+    style H fill:#e3f2fd,stroke:#1565c0
+    style K fill:#e8f5e9,stroke:#2e7d32
+    style L fill:#ffebee,stroke:#c62828
+    style Q fill:#ffebee,stroke:#c62828
+```
+
+**Walkthrough:**
+1. **Build Time**: A codemod scans for Reanimated 3 patterns (`useAnimatedGestureHandler`, `withTiming`, `withSpring`, `useDerivedValue`) and emits a manifest mapping logical names to file paths. This decouples the preloader from source layout.
+2. **Cold Start**: The first frame renders with *zero* worklet imports. We defer to `InteractionManager.runAfterInteractions` (or `requestIdleCallback` on web) so the main thread stays responsive.
+3. **Warm-up**: `runOnUI` executes a dynamic `require` for each manifest entry. The JSI runtime compiles bytecode and caches it. We store the module reference in a `WeakMap` so GC can reclaim it if the feature is never used.
+4. **Interaction**: When a component mounts, it checks a ready flag. If the worklet is compiled, we take the fast path. If not, we fall back to the Reanimated 3 implementation running on the JS thread. Both paths produce identical visual output.
+5. **Observability**: Every hit/miss increments a counter. Compilation latency is sampled. A remote kill switch forces fallback globally if a bad worklet slips through.
+
+## Core Concepts
+
+### Worklet Manifest
+A JSON artifact generated at build time. Example:
+```json
+{
+  "springScale": "src/animations/worklets/springScale.worklet.ts",
+  "dragHandler": "src/animations/worklets/dragHandler.worklet.ts",
+  "sharedTransition": "src/animations/worklets/sharedTransition.worklet.ts"
+}
+```
+Keys are stable identifiers. Values are relative paths resolvable by Metro. The manifest lives in `assets/worklets.manifest.json` so it bundles with the app.
+
+### Preloader Singleton
+A single instance that owns the compilation lifecycle. It reads the manifest, deduplicates requests, and exposes a `Promise<Map<string, WorkletModule>>` that resolves when all entries compile. Components await this promise *only* when they need the worklet—not at mount.
+
+### Dual-Path Components
+Every animated component implements two code paths behind a single interface:
+```typescript
+interface AnimationDriver {
+  start(config: SpringConfig): void;
+  stop(): void;
+}
+```
+The worklet driver calls `runOnUI`; the fallback driver uses `requestAnimationFrame` + `setState`. The component doesn't know which driver it receives.
+
+### Kill Switch
+A remote-config boolean (`reanimated4_kill_switch`). When `true`, the preloader resolves immediately with an empty map, forcing all components to the fallback path. Deployable without an app store update.
+
+## Examples & Code Walkthrough
+
+### 1. Build-Time Manifest Generator
+`scripts/generate-worklet-manifest.ts` — runs in CI before bundle.
+
+```typescript
+// scripts/generate-worklet-manifest.ts
+import { readFileSync, writeFileSync, readdirSync } from 'fs';
+import { resolve, extname, relative } from 'path';
+import { parse } from '@babel/parser';
+import traverse from '@babel/traverse';
+
+const ANIMATION_IMPORTS = new Set([
+  'useAnimatedGestureHandler',
+  'useAnimatedStyle',
+  'useDerivedValue',
+  'useSharedValue',
+  'withTiming',
+  'withSpring',
+  'withDecay',
+  'runOnUI',
+  'runOnJS',
+]);
+
+const WORKLET_DIR = resolve(__dirname, '../src/animations/worklets');
+const OUTPUT_PATH = resolve(__dirname, '../src/assets/worklets.manifest.json');
+
+function isWorkletFile(filePath: string): boolean {
+  const code = readFileSync(filePath, 'utf-8');
+  // Heuristic: file exports a function used as worklet
+  return /export\s+(default\s+)?function|export\s+const\s+\w+\s*=/.test(code) &&
+         /"worklet";|'worklet';/.test(code);
+}
+
+function extractWorkletExports(filePath: string): string[] {
+  const code = readFileSync(filePath, 'utf-8');
+  const ast = parse(code, { sourceType: 'module', plugins: ['typescript'] });
+  const exports: string[] = [];
+
+  traverse(ast, {
+    ExportNamedDeclaration(path) {
+      if (path.node.declaration) {
+        const id = path.node.declaration.id;
+        if (id && id.type === 'Identifier') {
+          exports.push(id.name);
+        }
+      }
+    },
+    ExportDefaultDeclaration(path) {
+      if (path.node.declaration.type === 'Identifier') {
+        exports.push(path.node.declaration.name);
+      }
+    },
+  });
+
+  return exports;
+}
+
+function main() {
+  const manifest: Record<string, string> = {};
+
+  function walk(dir: string) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = resolve(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (extname(entry.name) === '.ts' && isWorkletFile(full)) {
+        const exports = extractWorkletExports(full);
+        // Use filename as key, fallback to first named export
+        const key = entry.name.replace('.worklet.ts', '');
+        const relPath = relative(resolve(__dirname, '..'), full);
+        manifest[key] = `./${relPath.replace(/\\/g, '/')}`;
+      }
+    }
+  }
+
+  walk(WORKLET_DIR);
+  writeFileSync(OUTPUT_PATH, JSON.stringify(manifest, null, 2));
+  console.log(`[worklet-manifest] Generated ${Object.keys(manifest).length} entries`);
+}
+
+main();
+```
+**Why this works:** It avoids false positives by checking for the `"worklet";` directive. The manifest keys are stable (filename-based), so runtime code doesn't break when you refactor internals.
+
+---
+
+### 2. Runtime Preloader with Idle Scheduling
+`src/animations/WorkletPreloader.ts` — the only place that touches `runOnUI` at startup.
+
+```typescript
+// src/animations/WorkletPreloader.ts
+import { runOnUI } from 'react-native-reanimated';
+import { InteractionManager } from 'react-native';
+import manifest from '../assets/worklets.manifest.json';
+
+type WorkletModule = Record<string, unknown>;
+type Manifest = Record<string, string>; // key -> module path
+
+// WeakMap allows GC if feature never used
+const compiledCache = new WeakMap<string, WorkletModule>();
+let preloadPromise: Promise<void> | null = null;
+let preloadStatus: 'idle' | 'running' | 'done' | 'error' = 'idle';
+
+/**
+ * Reads the manifest and compiles every worklet on the UI thread.
+ * Safe to call multiple times; returns the same promise.
+ */
+export function preloadWorklets(): Promise<void> {
+  if (preloadPromise) return preloadPromise;
+
+  // Remote kill switch check (e.g., from Firebase Remote Config)
+  if (__DEV__ || global.__REANIMATED4_KILL_SWITCH__) {
+    preloadStatus = 'done';
+    return Promise.resolve();
+  }
+
+  preloadStatus = 'running';
+  const entries = Object.entries(manifest as Manifest);
+
+  preloadPromise = new Promise((resolve, reject) => {
+    // Yield to main thread until first paint + interactions settle
+    InteractionManager.runAfterInteractions(() => {
+      // Schedule on UI thread via runOnUI
+      const workletsToCompile = entries.map(([key, path]) => {
+        return runOnUI(() => {
+          try {
+            // Dynamic require compiles bytecode and caches in JSI
+            const mod = require(path);
+            compiledCache.set(key, mod);
+            return { key, success: true };
+          } catch (e) {
+            console.error(`[WorkletPreloader] Failed to compile ${key}:`, e);
+            return { key, success: false, error: e };
+          }
+        })();
+      });
+
+      Promise.all(workletsToCompile)
+        .then((results) => {
+          const failures = results.filter((r) => !r.success);
+          if (failures.length > 0) {
+            // Don't hard fail; log and continue with partial success
+            console.warn('[WorkletPreloader] Partial compilation failure:', failures);
+          }
+          preloadStatus = 'done';
+          resolve();
+        })
+        .catch((e) => {
+          preloadStatus = 'error';
+          reject(e);
+        });
+    });
+  });
+
+  return preloadPromise;
+}
+
+/**
+ * Synchronously check if a specific worklet is ready.
+ * Used by components to pick the fast path.
+ */
+export function isWorkletReady(key: string): boolean {
+  return compiledCache.has(key);
+}
+
+/**
+ * Get the compiled module (throws if not ready).
+ * Components should guard with isWorkletReady first.
+ */
+export function getWorkletModule(key: string): WorkletModule {
+  const mod = compiledCache.get(key);
+  if (!mod) throw new Error(`Worklet ${key} not compiled`);
+  return mod;
+}
+
+/**
+ * For testing / forced fallback.
+ */
+export function resetPreloader(): void {
+  preloadPromise = null;
+  preloadStatus = 'idle';
+}
+```
+**Key details:**
+- `InteractionManager.runAfterInteractions` ensures we don't compete with the first render.
+- `runOnUI` executes the `require` on the UI thread where JSI lives.
+- `WeakMap` prevents memory leaks if a worklet is never used.
+- Kill switch is a global set by remote config at startup.
+
+---
+
+### 3. Dual-Path Animated Component
+`src/components/InertialCard.tsx` — a draggable card with spring-back.
+
+```tsx
+// src/components/InertialCard.tsx
+import React, { useEffect, useRef } from 'react';
+import { View, PanGestureHandler, GestureHandlerRootView } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue,
+  useAnimatedGestureHandler,
+  useAnimatedStyle,
+  withSpring,
+  runOnJS,
+} from 'react-native-reanimated';
+import { preloadWorklets, isWorkletReady, getWorkletModule } from '../animations/WorkletPreloader';
+
+// --- Types ---
+interface SpringConfig {
+  damping: number;
+  stiffness: number;
+  mass: number;
+}
+
+interface AnimationDriver {
+  start(config: SpringConfig): void;
+  stop(): void;
+}
+
+// --- Fallback Driver (Reanimated 3 style, runs on JS thread) ---
+class JSThreadDriver implements AnimationDriver {
+  private animationId: number | null = null;
+  private readonly onUpdate: (value: number) => void;
+  private readonly onEnd: () => void;
+
+  constructor(onUpdate: (value: number) => void, onEnd: () => void) {
+    this.onUpdate = onUpdate;
+    this.onEnd = onEnd;
+  }
+
+  start({ damping, stiffness, mass }: SpringConfig) {
+    // Simple spring simulation on JS thread (for fallback only)
+    let position = 1;
+    let velocity = 0;
+    const target = 0.9;
+    const dt = 1 / 60;
+
+    const step = () => {
+      const force = -stiffness * (position - target);
+      const dampingForce = -damping * velocity;
+      const acceleration = (force + dampingForce) / mass;
+      velocity += acceleration * dt;
+      position += velocity * dt;
+
+      this.onUpdate(position);
+
+      if (Math.abs(velocity) < 0.01 && Math.abs(position - target) < 0.01) {
+        this.onUpdate(target);
+        this.onEnd();
+        return;
+      }
+      this.animationId = requestAnimationFrame(step);
+    };
+
+    this.animationId = requestAnimationFrame(step);
+  }
+
+  stop() {
+    if (this.animationId) cancelAnimationFrame(this.animationId);
+  }
+}
+
+// --- Worklet Driver (UI thread, Reanimated 4) ---
+class UIThreadDriver implements AnimationDriver {
+  private readonly sharedValue: Animated.SharedValue<number>;
+  private readonly workletKey = 'inertialSpring';
+
+  constructor(sharedValue: Animated.SharedValue<number>) {
+    this.sharedValue = sharedValue;
+  }
+
+  start(config: SpringConfig) {
+    if (!isWorkletReady(this.workletKey)) {
+      throw new Error('Worklet not ready; caller must guard');
+    }
+    const mod = getWorkletModule(this.workletKey);
+    // mod.default is a worklet function: (sv: SharedValue, config) => void
+    runOnUI(() => {
+      mod.default(this.sharedValue, config);
+    })();
+  }
+
+  stop() {

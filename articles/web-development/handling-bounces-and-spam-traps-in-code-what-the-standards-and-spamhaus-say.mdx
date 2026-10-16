@@ -1,0 +1,212 @@
+---
+title: "Handling Bounces and Spam Traps in Code: What the Standards and Spamhaus Say"
+slug: "handling-bounces-and-spam-traps-in-code-what-the-standards-and-spamhaus-say"
+description: "Email is still a core channel for product notifications, marketing, and transactional messages. When a message cannot be delivered, the remote server returns a ..."
+category: "Web Development"
+tags: ["handling", "spam", "bounces", "web development"]
+keywords: ["web development", "programming", "bounces", "tech guide", "handling", "software engineering", "spam"]
+author: "Lead Frontend & Web Architect"
+publishedAt: "2026-10-16"
+readingTime: "10 min read"
+---
+
+# Handling Bounces and Spam Traps in Code: What the Standards and Spamhaus Say
+
+## Introduction
+Email is still a core channel for product notifications, marketing, and transactional messages. When a message cannot be delivered, the remote server returns a bounce. If the address is a spam trap—an address that never opted in or has been reclaimed by an ISP—sending to it damages sender reputation and can get your domain blocked. Treating bounces and trap hits as first‑class events in your pipeline lets you keep lists clean, protect reputation, and avoid wasted bandwidth.
+
+## Why This Matters
+- **Deliverability cost** – Every bounce consumes SMTP connections and retries. High bounce rates trigger throttling by receiving MTAs.
+- **Reputation risk** – Spamhaus monitors trap hits; a single hit can land your IP on the SBL, causing widespread rejection.
+- **Operational overhead** – Manual list cleaning is error prone. Automated handling reduces support tickets and improves data hygiene.
+- **Compliance** – Regulations like CAN‑SPAM require honoring opt‑out requests; traps often indicate addresses that never opted in, so hitting them violates best practice.
+
+## How It Works
+The system splits into three loosely coupled stages: intake, classification, and feedback. Incoming bounces land on a durable queue (Kafka, SQS, or Pulsar). A worker service parses the raw RFC‑822 message, extracts the canonical fields defined in RFC 5535, and creates a typed `BounceEvent`. The event is then enriched with a spam‑trap check that queries Spamhaus SBL/DBL via a DNS‑BL lookup. Depending on the outcome, the worker either updates a reputation counter or emits a `SpamTrapEvent`. Both event types flow to a blacklist manager that pushes the offending address to a suppression list API, which the outbound mail service consults before attempting delivery.
+
+```mermaid
+flowchart TD
+    A[Inbound Bounce (SMTP/IMAP)] --> B[Message Queue]
+    B --> C[Bounce Worker]
+    C --> D{Parse RFC‑5535}
+    D -->|Hard/Soft| E[Extract Status Code & Text]
+    D -->|Transient| F[Apply Retry Back‑off]
+    E --> G[Create BounceEvent]
+    F --> G
+    G --> H{Spam‑Trap Check}
+    H -->|Yes| I[Emit SpamTrapEvent]
+    H -->|No| J[Update Reputation]
+    I --> K[Blacklist Manager]
+    J --> K
+    K --> L[Suppression List API]
+    L --> M[Outbound Mail Service]
+    M --> N[Final Delivery / Rejection]
+
+    style A fill:#f9f9f9,stroke:#333,stroke-width:1px
+    style B fill:#e0f7fa,stroke:#333,stroke-width:1px
+    style C fill:#fff3e0,stroke:#333,stroke-width:1px
+    style D fill:#f3e5f5,stroke:#333,stroke-width:1px
+    style E fill:#e8f5e9,stroke:#333,stroke-width:1px
+    style F fill:#e8f5e9,stroke:#333,stroke-width:1px
+    style G fill:#e3f2fd,stroke:#333,stroke-width:1px
+    style H fill:#fffde7,stroke:#333,stroke-width:1px
+    style I fill:#ffccbc,stroke:#333,stroke-width:1px
+    style J fill:#e0f2f1,stroke:#333,stroke-width:1px
+    style K fill:#ffecb3,stroke:#333,stroke-width:1px
+    style L fill:#c8e6c9,stroke:#333,stroke-width:1px
+    style M fill:#f1f8e9,stroke:#333,stroke-width:1px
+    style N fill:#cfd8dc,stroke:#333,stroke-width:1px
+```
+
+### Step‑by‑step walk‑through
+1. **Intake** – MTAs forward non‑delivery reports to a dedicated mailbox. A consumer pulls raw bytes and places them on the queue.
+2. **Parsing** – The worker uses the `email` package (Python) or `mailparser` (Node) to read headers. It trusts `Message‑ID` for deduplication and reads `Final‑Recipient` and `Status` per RFC 5535.
+3. **Classification** – The first digit of the status code determines hard (≥5) vs soft (4) bounces. A second digit of 0‑3 indicates a transient condition; 4‑5 indicates permanent.
+4. **Spam‑trap detection** – The recipient domain is lower‑cased and queried against `zen.spamhaus.org` (a combined DNSBL). A positive response means the domain appears on SBL, DBL, or XBL; we treat it as a trap.
+5. **Feedback** – On a trap hit, we publish a `SpamTrapEvent`. On a bounce we may schedule a retry (exponential back‑off with jitter) or mark the address as permanently undeliverable after a configurable threshold.
+6. **Suppression** – The blacklist manager writes the address to a suppression list via an internal API. The outbound service checks this list before queuing a message, preventing further sends.
+
+## Core Concepts
+- **RFC 5322** – Defines the basic Internet Message Format; headers like `Message-ID`, `Date`, `From`.
+- **RFC 5530** – Introduces the `Feedback‑Loop` (FBL) header used by ISPs to forward complaints.
+- **RFC 5535** – Describes the `Delivery Status Notifications` (DSN) format; the `Status` header follows the scheme `x.y.z` where `x` is the class.
+- **RFC 6206** – Defines the `Message‑ID` header syntax; guarantees global uniqueness when generated correctly.
+- **Spamhaus SBL** – Spam Block List; contains IP ranges owned by spammers.
+- **Spamhaus DBL** – Domain Block List; lists domains used in spam.
+- **Pristine trap** – An address that never existed; appears only when a sender guesses or purchases a list.
+- **Recycled trap** – A once‑legitimate address reclaimed by the ISP after a period of inactivity.
+- **Idempotent processing** – Using `Message-ID` as a deduplication key ensures retries do not double‑count events.
+- **Back‑off strategy** – Exponential back‑off with full jitter reduces thundering herd problems on MTAs.
+
+## Examples & Code Walkthrough
+Below are production‑ready snippets that illustrate the parsing and trap‑check logic. They avoid external dependencies beyond the language standard library or a lightweight HTTP client.
+
+### Python – Bounce Event Dataclass & Parser
+```python
+from dataclasses import dataclass
+from email import policy
+from email.parser import BytesParser
+from typing import Optional
+
+@dataclass(frozen=True)
+class BounceEvent:
+    """Immutable representation of a bounce notice."""
+    message_id: str          # Stripped of surrounding <>
+    recipient: str           # Email address that caused the bounce
+    status_code: int         # First digit of the DSN status (e.g., 5)
+    status_text: str         # Human readable part after the code
+    reason: Optional[str] = None   # Optional free‑form reason from the MTA
+
+def parse_bounce(raw: bytes) -> BounceEvent:
+    """
+    Convert a raw RFC‑822 bounce into a BounceEvent.
+    The function deliberately uses only the stdlib to stay portable.
+    """
+    msg = BytesParser(policy=policy.default).parsebytes(raw)
+
+    # Message‑ID is the only reliable correlation key across retries.
+    msg_id = msg.get("Message-ID", "").strip("<>")
+
+    # Final‑Recipient is defined in RFC 3464 (DSN); fall back to To if missing.
+    recipient = msg.get("Final-Recipient") or msg.get("To") or ""
+    recipient = recipient.strip("<>")
+
+    # The Status header follows the format "x.y.z Text".
+    status_raw = msg.get("Status", "")
+    parts = status_raw.split(maxsplit=1)
+    status_code = int(parts[0]) if parts else 0
+    status_text = parts[1] if len(parts) > 1 else ""
+
+    # Some MTAs expose a reason in the optional DSN field.
+    reason = msg.get("DSN-Gateway") or None
+
+    return BounceEvent(
+        message_id=msg_id,
+        recipient=recipient,
+        status_code=status_code,
+        status_text=status_text,
+        reason=reason,
+    )
+```
+
+**Why this works**  
+- The `frozen=True` flag makes instances hashable, safe for use as keys in a deduplication set.  
+- We strip angle brackets from `Message-ID` to normalize across MTAs that may or may not include them.  
+- The function returns a status code as an integer, enabling fast numeric comparison (`>=5` for hard bounces).  
+- No external parsing library is required, which simplifies deployment in minimal containers.
+
+### Node.js – Spam‑Trap Guard Middleware
+```javascript
+// spamGuard.js
+const { promisify } = require('util');
+const dnsResolve = promisify(require('dns').resolve);
+
+/**
+ * Checks whether the domain of an email address appears in Spamhaus SBL/DBL/XBL.
+ * Uses the combined Zen DNSBL (zen.spamhaus.org) which aggregates all three lists.
+ * @param {string} email - Full email address.
+ * @returns {Promise<boolean>} true if the domain is listed as a trap source.
+ */
+async function isSpamTrapDomain(email) {
+  const domain = email.split('@')[1].toLowerCase();
+  // Construct a reverse‑lookup query: <domain>.zen.spamhaus.org
+  const query = `${domain}.zen.spamhaus.org`;
+  try {
+    const records = await dnsResolve(query, 'A');
+    // Any A record means the domain is listed.
+    return records.length > 0;
+  } catch (err) {
+    // dns.resolve returns ENOTFOUND when the name does not exist → not listed.
+    if (err.code === 'ENOTFOUND') return false;
+    // Unexpected error – fail open to avoid blocking legitimate mail.
+    console.warn(`DNS query failed for ${query}: ${err}`);
+    return false;
+  }
+}
+
+/**
+ * Middleware to be called before enqueuing an outbound message.
+ * @param {string} email - Recipient address.
+ * @returns {Promise<boolean>} true if the address should be suppressed.
+ */
+async function spamGuard(email) {
+  const isTrap = await isSpamTrapDomain(email);
+  if (isTrap) {
+    console.info(`[SpamGuard] Trap hit: ${email}`);
+    // Emit a domain‑specific event for downstream blacklisting.
+    // Example: eventEmitter.emit('spam_trap', { email, domain: email.split('@')[1] });
+  }
+  return isTrap;
+}
+
+module.exports = { spamGuard };
+```
+
+**Explanation**  
+- We leverage the built‑in `dns` module to perform a real‑time DNSBL lookup; this avoids extra dependencies and gives deterministic latency.  
+- The `zen.spamhaus.org` zone combines SBL, XBL, and DBL, so a single query covers all trap‑related listings.  
+- On transient DNS errors we log and assume the address is clean; this prevents accidental blacklisting during temporary resolver issues.  
+- The function returns a boolean that the caller can use to decide whether to push the address to a suppression list or to abort the send attempt.
+
+## Best Practices
+- **Never treat a single bounce as permanent** – Wait for a threshold (e.g., three consecutive hard bounces) before suppressing.  
+- **Respect Spamhaus query limits** – Cache DNSBL results for at least 24 hours; use a local LRU cache or Redis to stay under the free‑tier request rate.  
+- **Use idempotent keys** – Store `Message-ID` in a set or database with a TTL longer than the maximum retry window to avoid duplicate processing.  
+- **Separate bounce workers from outbound workers** – Isolate the CPU‑intensive parsing and DNS lookup from the high‑throughput sending path.  
+- **Expose metrics early** – Increment counters for `bounce_hard`, `bounce_soft`, `trap_hit`, and `retry_attempt` in Prometheus or StatsD; alert when ratios exceed 1 % for hard bounces or 0.1 % for trap hits.  
+- **Test with real DSN samples** – Keep a small library of actual bounce messages from major providers (Gmail, Outlook, Yahoo) to validate your parser against edge cases.  
+- **Log the raw headers** for any event that triggers a suppression; this aids forensic analysis if a false positive occurs.  
+
+## Common Mistakes & Anti‑Patterns
+| Mistake | Why it hurts | Fix |
+|---------|--------------|-----|
+| **Suppressing after the first soft bounce** | Soft bounces often indicate transient issues (mailbox full, throttling). Premature suppression harms deliverability and increases churn. | Require a configurable count of consecutive soft bounces (e.g., 5) before treating as permanent. |
+| **Blocking the entire domain on a single trap hit** | A domain may contain both trap and legitimate addresses (e.g., a corporate domain with a role account that became a trap). Over‑blocking hurts legitimate traffic. | Apply suppression at the address level; only escalate to domain‑level after a threshold of trap hits within a short window. |
+| **Performing a DNS lookup for every recipient in the hot path** | Adds latency and can exhaust resolver capacity under load. | Perform the check asynchronously, cache results, and fall back to a local suppress list for known bad domains. |
+| **Ignoring the `Message-ID` for deduplication** | Leads to double counting when MTAs retry the same bounce, inflating metrics and causing unnecessary suppression attempts. | Use `Message-ID` as the primary key; if missing, fall back to a hash of `Final-Recipient` + `Date`. |
+| **Hard‑coding Spamhaus API keys** | Exposes credentials if the repo is public and violates Spamhaus’s terms of service. | Use environment variables or a secret manager; never commit keys to source control. |
+
+## Performance Considerations
+- **Parsing cost** – RFC‑822 parsing is O(n) in message size; typical bounces are < 10 KB, so CPU impact is negligible (< 0.2 ms per message on a modern core).  
+- **DNS latency** – A single UDP query to a public resolver averages 20‑30 ms; with caching, the effective latency drops to < 2 ms after warm‑up.  
+- **Queue throughput** – Kafka can sustain > 100 k msgs/sec

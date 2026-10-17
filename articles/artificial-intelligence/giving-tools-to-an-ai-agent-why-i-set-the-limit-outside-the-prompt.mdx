@@ -1,0 +1,311 @@
+---
+title: "Giving tools to an AI agent: why I set the limit outside the prompt"
+slug: "giving-tools-to-an-ai-agent-why-i-set-the-limit-outside-the-prompt"
+description: "The last few weeks have been filled with articles that show LLMs chatting with databases, making API calls, and acting as autonomous workers. Yet most of those ..."
+category: "Artificial Intelligence"
+tags: ["artificial intelligence", "giving", "tools", "agent"]
+keywords: ["agent", "giving", "tech guide", "artificial intelligence", "software engineering", "tools", "programming"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-10-17"
+readingTime: "8 min read"
+---
+
+# Giving tools to an AI agent: why I set the limit outside the prompt
+
+## Introduction  
+The last few weeks have been filled with articles that show LLMs chatting with databases, making API calls, and acting as autonomous workers. Yet most of those demos still hide their guardrails inside the prompt itself. We sprinkle a handful of numbers—like “maximum five queries per turn”—directly into the conversation and pray the model obeys. In production, however, that approach collapses under pressure. Prompt‑engineered caps become invisible when the model receives a model update, they disappear during load spikes, and they vanish from audit logs. The result is an agent that looks obedient one day and behaves wildly the next.
+
+I decided to move the enforcement engine out of the prompt and into the agent’s runtime. By treating limits as first‑class components of the execution graph, the system gains determinism, observable behavior, and a shared vocabulary that scales across teams. The following sections walk through why this matters, how the architecture works, and concrete code that demonstrates the design.
+
+## Why This Matters  
+In live services, a limit embedded in a prompt is essentially a suggestion that can be overridden whenever something new arrives. When a model vendor releases a newer version with broader capabilities, the old wording may suddenly permit unauthorized actions—or conversely, unintentionally restrict useful workflows. Moreover, without a dedicated limit service there is no place to record every tool invocation, making debugging, cost accounting, and compliance impossible. An isolated limit manager provides:
+
+* **Predictable behavior** – every request sees the same ceiling, regardless of which LLM version runs it.  
+* **Full observability** – every call can be logged, counted, and alerted against.  
+* **Shared governance** – a single registry can serve dozens of agents, eliminating duplicated guardrails.  
+
+These benefits translate directly into lower incident rates and faster feature rollouts.
+
+## How It Works  
+The core idea is to decouple the *what* (the prompt) from the *how much* (resource limits). Instead of embedding quantities in the text, the agent talks to a lightweight runtime that enforces quotas before any tool is invoked. The process follows a straightforward loop:
+
+1. **Prompt generation** – the agent builds a natural‑language description of the task, omitting any metric strings.  
+2. **Request dispatch** – the orchestration layer forwards the prompt to the chosen tool.  
+3. **Limit evaluation** – the limit manager checks the current request against configured quotas (global cap, per‑tool burst, sliding window).  
+4. **Execution** – if the request survives the check, it proceeds to the tool’s implementation; otherwise, the orchestrator either aborts or queues the call for later.  
+5. **Audit trail** – every decision (accepted, denied, throttled) is recorded by the logger component.  
+
+The diagram below captures this flow.
+
+```mermaid
+flowchart TD
+    A[User Request] -->|Generate Prompt (no limits)| B[Agent Orchestrator]
+    B --> C{Tool Selection}
+    C --> D[Call Tool via Semaphore Managed by LimitManager]
+    D --> E{Is Limit Exceeded?}
+    E -- Yes --> F[Log Breach, Skip Call]
+    E -- No --> G[Execute Tool]
+    G --> H[Append Result to Audit Buffer]
+    H --> I[Return Response]
+```
+
+## Core Concepts  
+
+| Component | Responsibility |
+|-----------|----------------|
+| **Tool Registry** | Central catalogue of available functions, each annotated with cost, latency tiers, and permission flags. |
+| **Limit Manager** | Enforces global request caps, per‑tool burst budgets, and sliding‑window policies. It maintains state (counts, timestamps) and offers atomic rejection when thresholds are crossed. |
+| **Agent Orchestrator** | Decides which tool to invoke based on the prompt, applies the limit manager’s gate, and supplies the generated prompt to the tool executor. |
+| **Audit Logger** | Records timestamps, tool identifiers, input hashes, and outcome status. Logs are emitted to stdout or sent to a persistent store for downstream analytics. |
+
+The Limit Manager is deliberately stateless regarding individual jobs; instead it tracks aggregate statistics so that a burst of traffic does not silently accumulate beyond a defined threshold.
+
+## Examples & Code Walkthrough  
+
+Below is a self‑contained implementation written in Python 3.11. It contains original class definitions, a minimal weather service, a discount calculator, and an event logger. All parts interact through the Limit Manager rather than through any textual constraint.
+
+```python
+import asyncio
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Any, Callable, Awaitable
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolSpec:
+    """Metadata describing a callable tool."""
+    name: str
+    fn: Callable[[], Awaitable[Any]]
+    cost: int          # arbitrary monetary unit
+    max_concurrent: int  # parallelism ceiling
+    burst_allowance: int  # extra calls permitted above steady state
+
+
+@dataclass
+class Quota:
+    """Global request quota expressed as total calls per minute."""
+    limit: int          # e.g., 500 calls/minute
+
+
+@dataclass
+class SlidingWindow:
+    """
+    Tracks timestamps of recent tool invocations so that a burst does not exceed
+    the overall limit even when many calls arrive simultaneously.
+    """
+    window_size_sec: int = 60
+    entries: list[float] = field(default_factory=list)
+
+    def prune(self) -> None:
+        now = time.monotonic()
+        self.entries = [ts for ts in self.entries if now - ts < self.window_size_sec]
+
+    def count(self) -> int:
+        self.prune()
+        return len(self.entries)
+
+
+# ---------------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------------
+
+class ToolRegistry:
+    """Simple in‑memory dictionary that maps friendly names to ToolSpec objects."""
+
+    def __init__(self) -> None:
+        self._tools: Dict[str, ToolSpec] = {}
+
+    def register(self, spec: ToolSpec) -> None:
+        self._tools[spec.name] = spec
+
+    def get(self, name: str) -> Optional[ToolSpec]:
+        return self._tools.get(name)
+
+
+# ---------------------------------------------------------------------------
+# Limit manager
+# ---------------------------------------------------------------------------
+
+class LimitManager:
+    """
+    Central authority for quotas, burst limits, and sliding‑window policies.
+    """
+
+    def __init__(self, global_quota: Quota, slid_window: SlidingWindow):
+        self.global_quota = global_quota
+        self.sliding = slid_window
+
+    # -----------------------------------------------------------------------
+    # Enforcement helpers
+    # -----------------------------------------------------------------------
+
+    def enforce(self, request_count: int) -> bool:
+        """
+        Returns True if the request is allowed, False otherwise.
+        """
+        # Global rate limit
+        if request_count >= self.global_quota.limit:
+            return False
+
+        # Per‑tool burst limit (simple counter for illustration)
+        # In production you would store a map keyed by tool ID.
+        token_counter = self._get_token_counter(request_count)
+        if token_counter >= self.global_quota.max_concurrent:
+            return False
+
+        # Sliding‑window check
+        self.sliding.count()                     # automatically purges old timestamps
+        if self.sliding.count() >= self.global_quota.max_concurrent:
+            return False
+
+        return True
+
+    def reset(self) -> None:
+        """Clear counters after a graceful shutdown."""
+        self.sliding.entries.clear()
+
+    # -----------------------------------------------------------------------
+    # Internals
+    # -----------------------------------------------------------------------
+
+    def _get_token_counter(self, idx: int) -> int:
+        """Very naive token bucket – replace with Redis or similar in prod."""
+        return idx % self.global_quota.max_concurrent
+
+
+# ---------------------------------------------------------------------------
+# Sample tools
+# ---------------------------------------------------------------------------
+
+class WeatherService:
+    """Simulates a weather lookup that costs a small amount of compute."""
+
+    async def fetch_weather(self, city: str) -> dict:
+        await asyncio.sleep(0.2)               # mimic network latency
+        return {
+            "city": city,
+            "temp_c": 22,
+            "humidity": 0.55
+        }
+
+
+class DiscountEngine:
+    """Applies tiered discounts plus a volume bonus."""
+
+    async def calculate_discount(self, order_value: float, tier: int) -> float:
+        base = 0.05 * tier
+        bonus = 0.01 if order_value > 1000 else 0.0
+        await asyncio.sleep(0.1)
+        return round(order_value * (1 - (base + bonus)), 2)
+
+
+class EventLogger:
+    """Records events in an in‑memory buffer (stand‑in for a real DB)."
+
+    async def log_event(self, payload: dict) -> None:
+        buffer.append({"ts": time.time(), "payload": payload})
+        await asyncio.sleep(0.05)              # simulate logging latency
+
+
+# ---------------------------------------------------------------------------
+# Agent orchestrator
+# ---------------------------------------------------------------------------
+
+class AgentOrchestrator:
+    """
+    Selects the appropriate tool based on the prompt, obtains a dynamic
+    semaphore from the LimitManager, and executes the call.
+    """
+
+    def __init__(self, registry: ToolRegistry, limit_mgr: LimitManager):
+        self._registry = registry
+        self._limit = limit_mgr
+
+    async def execute(self, prompt: str, tool_name: str, arguments: dict) -> Any:
+        # Determine which tool to invoke – a trivial heuristic for demonstration.
+        tool = self._registry.get(tool_name)
+        if tool is None:
+            raise ValueError(f"Unknown tool {tool_name!r}")
+
+        # Current call depth (simple in‑memory counter for brevity).
+        depth = sum(
+            1 for _ in iter(lambda: self._limit.enforce(depth), False)
+        )  # placeholder; real impl would keep a mutable counter
+
+        # Ask the limit manager whether we have capacity.
+        if not self._limit.enforce(depth):
+            print("⚠️  Limit exceeded – aborting call")
+            return None
+
+        # Acquire a semaphore sized according to the tool's own maximum concurrency.
+        sem = asyncio.Semaphore(self._limit.global_quota.max_concurrent)
+        async with sem:
+            try:
+                func = tool.fn
+                return await func(**arguments)
+            except Exception as exc:
+                print(f"❌ Tool {tool_name} failed: {exc}")
+                raise
+
+    @property
+    def tools(self) -> list[str]:
+        return list(self._registry._tools.keys())
+
+
+# ---------------------------------------------------------------------------
+# Demo runner
+# ---------------------------------------------------------------------------
+
+async def run_task(prompt: str, tool_name: str, args: dict) -> Any:
+    registry = ToolRegistry()
+    # Register sample utilities
+    registry.register(ToolSpec(
+        name="weather",
+        fn=lambda c: WeatherService().fetch_weather(c),
+        cost=1,
+        max_concurrent=5,
+        burst_allowance=2,
+    ))
+    registry.register(ToolSpec(
+        name="discount",
+        fn=lambda v, t: DiscountEngine().calculate_discount(v, t),
+        cost=2,
+        max_concurrent=3,
+        burst_allowance=1,
+    ))
+    registry.register(ToolSpec(
+        name="event_logger",
+        fn=lambda p: EventLogger().log_event(p),
+        cost=0.5,
+        max_concurrent=10,
+        burst_allowance=5,
+    ))
+
+    limiter = LimitManager(
+        global_quota=Quota(limit=20, window_size_sec=60),
+        slid_window=SlidingWindow(window_size_sec=60)
+    )
+    orchestrator = AgentOrchestrator(registry, limiter)
+
+    # Build a prompt that describes the intent without any numeric limits.
+    task_prompt = (
+        f"I am tasked with fetching the weather for Paris and calculating a "
+        "discount for a $1500 order, then logging the activity. "
+        "Please perform each step in sequence."
+    )
+
+    # Execute the workflow – three concurrent calls to illustrate throttling.
+    tasks = [
+        orchestrator.execute(task_prompt, "weather", {"city": "Paris"}),
+        orchestrator.execute(task_prompt, "discount", {"order_value": 1500.0, "tier": 2}),
+        orchestrator.execute(task_prompt, "event_logger", {"action": "completed"}),
+    ]
+    results = await asyncio.gather(*tasks)
+    for r in results:
+        print(r)
+
+    # Print final limit statistics.

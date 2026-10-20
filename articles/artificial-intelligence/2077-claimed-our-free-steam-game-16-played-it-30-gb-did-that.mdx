@@ -1,0 +1,324 @@
+---
+title: "2,077 claimed our free Steam game. 16 played it. 30 GB did that"
+slug: "2077-claimed-our-free-steam-game-16-played-it-30-gb-did-that"
+description: "Our studio released a free indie title on Steam. Within the first 48 hours we logged 2,077 “claim” events – users adding the game to their library. Only 16 actu..."
+category: "Artificial Intelligence"
+tags: ["claimed", "free", "steam", "artificial intelligence"]
+keywords: ["steam", "tech guide", "free", "software engineering", "programming", "claimed", "artificial intelligence"]
+author: "Senior AI Research Scientist"
+publishedAt: "2026-10-20"
+readingTime: "8 min read"
+---
+
+# 2,077 claimed our free Steam game. 16 played it. 30 GB did that
+
+## Introduction
+Our studio released a free indie title on Steam. Within the first 48 hours we logged 2,077 “claim” events – users adding the game to their library. Only 16 actually launched the executable, and the telemetry bucket swelled to 30 GB. The disparity was too large to ignore. We needed a systematic way to understand why the conversion rate collapsed and where the storage was coming from.
+
+## Why This Matters
+Software engineers and architects face the same dilemma daily: massive ingestion of user‑generated events that never translate into product value. Ignoring the gap leads to:
+
+* Wasted bandwidth and storage costs (the 30 GB we observed).
+* Misguided marketing decisions based on inflated claim numbers.
+* Poor user experience when resources are allocated to inactive accounts.
+
+A robust AI‑driven analysis pipeline turns raw telemetry into actionable insights, allowing us to prune noise, detect anomalies, and predict future play probability with measurable precision.
+
+## How It Works
+We built a streaming‑first pipeline that ingests claim events, enriches them with contextual features, runs a lightweight anomaly detector, and feeds the resulting vectors into a gradient‑boosting model that estimates the likelihood of a user actually playing the game. The flow is visualized below.
+
+```mermaid
+flowchart TD
+    A[Claim Event (Kafka Topic)] --> B[Event Ingestion Service]
+    B --> C{Feature Extraction}
+    C --> D[Enriched Event (Schema Registry)]
+    D --> E[Anomaly Detector (Isolation Forest)]
+    E --> F{Anomaly?}
+    F -->|Yes| G[Alert & Drop]
+    F -->|No| H[Feature Store]
+    H --> I[Model Inference (GBDT)]
+    I --> J{Prediction Score}
+    J -->|Score > 0.7| K[Mark as High‑Risk]
+    J -->|Score ≤ 0.7| L[Mark as Low‑Risk]
+    K --> M[Push to Dashboard]
+    L --> M
+    M --> N[Periodic Model Retraining]
+```
+
+**Step‑by‑step breakdown**
+
+1. **Event Ingestion** – A lightweight Go service reads from a Kafka partition, validates JSON schema, and writes to a PostgreSQL `raw_claim` table with a `created_at` timestamp.
+2. **Feature Extraction** – Python scripts pull fields such as `ip_country`, `device_type`, `steam_id_fingerprint`, and `claim_source`. Missing values are filled with a sentinel (“unknown”) and numeric fields are log‑scaled.
+3. **Anomaly Detection** – An Isolation Forest model flags outliers (e.g., claim bursts from a single IP). Anomalous events are quarantined and trigger an alert without reaching the model.
+4. **Model Inference** – A XGBoost classifier trained on historical claim‑to‑play data scores each event. A threshold of 0.7 balances precision and recall for our use case.
+5. **Feedback Loop** – Actual play events are logged into a separate table. Every 24 h we retrain the model using the latest data, ensuring drift is caught early.
+
+## Core Concepts
+* **ClaimEvent** – Immutable record of a user adding the game to their Steam library. Fields: `claim_id`, `steam_id`, `ip`, `user_agent`, `timestamp`, `region`.
+* **EnrichedEvent** – After feature extraction, we store a denormalized view: `claim_id`, `device_category`, `geo_hash`, `fingerprint_hash`, `feature_vector` (list of floats).
+* **Anomaly Detector** – Isolation Forest with `n_estimators=100`. It operates on a subset of numeric features (e.g., `hour_of_day`, `claim_rate_per_ip`).
+* **Model Versioning** – Each trained model is saved as a MLflow artifact with a semantic version tag (`v1`, `v2`). This enables roll‑back if performance degrades.
+* **Score Thresholding** – We use a static threshold for now, but a future A/B test will introduce a dynamic threshold based on business goals (e.g., cost‑per‑acquire).
+
+## Examples & Code Walkthrough
+Below is a self‑contained Python script that demonstrates feature extraction, model training, and inference. It uses `pandas` for data manipulation, `scikit‑learn` for preprocessing, and `xgboost` for the classifier. Defensive checks are included for missing or malformed rows.
+
+```python
+#!/usr/bin/env python3
+"""
+claim_to_play_predictor.py
+
+Pipeline component:
+1. Load raw claim events from a CSV (simulating PostgreSQL dump).
+2. Extract and encode features.
+3. Train a gradient‑boosting model on labeled data (play = 1 / 0).
+4. Persist model with MLflow.
+5. Run inference on new events and output predictions.
+"""
+
+import os
+import sys
+import json
+import logging
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_auc_score
+import xgboost as xgb
+import mlflow
+import mlflow.sklearn
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Constants
+RAW_CSV_PATH = Path(os.getenv("RAW_CSV_PATH", "raw_claims.csv"))
+LABELED_CSV_PATH = Path(os.getenv("LABELED_CSV_PATH", "labeled_play_events.csv"))
+MODEL_OUTPUT_DIR = Path(os.getenv("MODEL_OUTPUT_DIR", "./models"))
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
+MLFLOW_MODEL_NAME = "claim_to_play_model"
+
+# Expected columns in raw claim data
+RAW_COLUMNS = {
+    "claim_id": str,
+    "steam_id": str,
+    "ip": str,
+    "user_agent": str,
+    "timestamp": str,
+    "region": str,
+    "device_type": str,
+    "os_version": str,
+}
+
+def load_csv_safely(path: Path, expected_columns: Dict[str, Any]) -> pd.DataFrame:
+    """Load CSV with basic validation. Abort on critical errors."""
+    if not path.exists():
+        logger.error(f"Input file not found: {path}")
+        sys.exit(1)
+
+    try:
+        df = pd.read_csv(path, dtype=str)  # read all as string to preserve formatting
+    except Exception as e:
+        logger.error(f"Failed to read {path}: {e}")
+        sys.exit(1)
+
+    # Ensure required columns are present
+    missing = set(expected_columns.keys()) - set(df.columns)
+    if missing:
+        logger.error(f"Missing columns in {path}: {missing}")
+        sys.exit(1)
+
+    # Basic sanitisation: strip whitespace from column names
+    df.columns = df.columns.str.strip()
+    return df
+
+def extract_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Transform raw claim rows into a feature matrix."""
+    # Make a copy to avoid mutating input
+    out = df.copy()
+
+    # 1. Parse timestamp
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
+    out["hour_of_day"] = out["timestamp"].dt.hour
+    out["day_of_week"] = out["timestamp"].dt.dayofweek
+
+    # 2. Geolocation hash (simple first 3 octets of IP)
+    def ip_hash(ip: str) -> str:
+        parts = ip.split(".")
+        if len(parts) >= 3:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}"
+        return "0.0.0"
+
+    out["ip_hash"] = out["ip"].apply(ip_hash)
+
+    # 3. Device category aggregation
+    device_map = {
+        "mobile": "mobile",
+        "ios": "mobile",
+        "android": "mobile",
+        "pc": "desktop",
+        "console": "console",
+    }
+    out["device_category"] = out["device_type"].str.lower().map(device_map).fillna("unknown")
+
+    # 4. OS family
+    os_map = {
+        "windows": "windows",
+        "macos": "macos",
+        "linux": "linux",
+        "android": "android",
+    }
+    out["os_family"] = out["os_version"].str.lower().str.split('.').str[0].map(os_map).fillna("unknown")
+
+    # 5. Region sanity check (allow unknown)
+    out["region"] = out["region"].str.upper().fillna("UNKNOWN")
+
+    # 6. Fingerprint (steam_id + ip_hash) for duplicate detection
+    out["fingerprint"] = out["steam_id"] + "|" + out["ip_hash"]
+
+    # 7. Derived counts (placeholder – in production we would join with aggregated tables)
+    # For demo we set dummy values.
+    out["prev_claims_per_fingerprint"] = 0
+    out["claims_per_hour_per_ip"] = 0
+
+    # Select final feature columns
+    feature_cols = [
+        "hour_of_day",
+        "day_of_week",
+        "device_category",
+        "os_family",
+        "region",
+        "prev_claims_per_fingerprint",
+        "claims_per_hour_per_ip",
+    ]
+    return out[feature_cols]
+
+def build_preprocessor() -> ColumnTransformer:
+    """Create a scikit‑learn ColumnTransformer for mixed numeric/categorical data."""
+    numeric_features = ["hour_of_day", "day_of_week",
+                        "prev_claims_per_fingerprint", "claims_per_hour_per_ip"]
+    categorical_features = ["device_category", "os_family", "region"]
+
+    numeric_transformer = StandardScaler()
+    categorical_transformer = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+
+    return ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, numeric_features),
+            ("cat", categorical_transformer, categorical_features),
+        ]
+    )
+
+def train_model(X_train: np.ndarray, y_train: np.ndarray, run_id: str) -> Pipeline:
+    """Train XGBoost classifier wrapped in a pipeline with preprocessor."""
+    preprocessor = build_preprocessor()
+
+    # Use a pipeline to keep preprocessing and model together
+    model = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", xgb.XGBClassifier(
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.05,
+            objective="binary:logistic",
+            eval_metric="auc",
+            use_label_encoder=False,
+            seed=42,
+            missing=np.nan,
+        )),
+    ])
+
+    logger.info("Starting model training...")
+    model.fit(X_train, y_train)
+
+    # Log with MLflow
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    with mlflow.start_run(run_name=f"claim_to_play_{run_id}") as run:
+        mlflow.sklearn.log_model(model, artifact_path="model")
+        mlflow.log_params({
+            "n_estimators": 200,
+            "max_depth": 5,
+            "learning_rate": 0.05,
+            "feature_set": "v1",
+        })
+        logger.info(f"Model logged with MLflow run_id: {run.info.run_id}")
+
+    return model
+
+def evaluate_model(model: Pipeline, X_test: np.ndarray, y_test: np.ndarray) -> float:
+    """Return AUC‑ROC on the test set."""
+    preds = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, preds)
+    logger.info(f"Model AUC‑ROC: {auc:.4f}")
+    return auc
+
+def infer_new_events(model: Pipeline, new_df: pd.DataFrame) -> pd.DataFrame:
+    """Apply the trained model to fresh claim events."""
+    X_new = extract_features(new_df)
+    # The pipeline's preprocessor will transform; XGBoost will produce probabilities.
+    probs = model.predict_proba(X_new)[:, 1]
+    out = new_df.copy()
+    out["play_probability"] = probs
+    out["prediction"] = (probs > 0.7).astype(int)
+    return out[["claim_id", "play_probability", "prediction"]]
+
+def main():
+    # 1. Load raw claims (unlabeled) and labeled play events
+    raw_df = load_csv_safely(RAW_CSV_PATH, RAW_COLUMNS)
+    labeled_df = load_csv_safely(LABELED_CSV_PATH, RAW_COLUMNS)
+
+    # 2. Merge labeled data to create target column
+    # Simulate a label column: if claim_id appears in labeled_df, it's a play.
+    labeled_ids = set(labeled_df["claim_id"])
+    raw_df["play_label"] = raw_df["claim_id"].isin(labeled_ids).astype(int)
+
+    # 3. Feature extraction
+    feature_df = extract_features(raw_df)
+
+    # 4. Prepare training data
+    X = feature_df
+    y = raw_df["play_label"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # 5. Train model
+    model = train_model(X_train, y_train, run_id="v1")
+
+    # 6. Evaluate
+    evaluate_model(model, X_test, y_test)
+
+    # 7. Example inference on a small subset of raw data
+    sample = raw_df.head(10)
+    predictions = infer_new_events(model, sample)
+    logger.info("Sample predictions:\n%s", predictions.to_string(index=False))
+
+    # 8. Persist model locally (optional)
+    MODEL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    import joblib
+    joblib.dump(model, MODEL_OUTPUT_DIR / "claim_to_play_model_v1.joblib")
+    logger.info(f"Model persisted to {MODEL_OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
+```
+
+**Explanation of key defensive choices**
+
+* **Schema validation** – The script aborts if required columns are missing, preventing silent data corruption.
+* **Error‑tolerant datetime parsing** – `errors="coerce"` ensures malformed timestamps become `NaT` rather than crashing the pipeline.
+* **One‑Hot handling** – `handle_unknown="ignore"` prevents new categories in production data from breaking the model.
+* **MLflow integration** – Every training run is tracked, enabling reproducibility and rollback.
+* **Missing value handling** – The preprocessor leaves `NaN` for numeric fields; XGBoost natively supports missing values.
+
+## Best Practices
+* **Schema registry** – Use Confluent Schema Registry for Kafka messages to guarantee downstream consumers understand evolving event structures.
+* **Idempotent ingestion** – Deduplicate claim events by `fingerprint` before processing; store a hash of

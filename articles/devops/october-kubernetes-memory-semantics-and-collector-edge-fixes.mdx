@@ -1,0 +1,237 @@
+---
+title: "October: Kubernetes memory semantics and Collector edge fixes"
+slug: "october-kubernetes-memory-semantics-and-collector-edge-fixes"
+description: "Kubernetes 1.31 and 1.32 solidified `MemoryQoS` (KEP‑3558) while many distributions now enable cgroup v2 by default. At the same time, the OpenTelemetry Collect..."
+category: "DevOps"
+tags: ["memory", "october", "kubernetes", "devops"]
+keywords: ["october", "programming", "memory", "tech guide", "kubernetes", "software engineering", "devops"]
+author: "Staff DevOps & Infrastructure Engineer"
+publishedAt: "2026-11-01"
+readingTime: "8 min read"
+---
+
+# October: Kubernetes memory semantics and Collector edge fixes
+
+## Introduction
+Kubernetes 1.31 and 1.32 solidified `MemoryQoS` (KEP‑3558) while many distributions now enable cgroup v2 by default. At the same time, the OpenTelemetry Collector has matured its `memoryballastextension` to version 0.110. The combination creates a narrow window where the semantics of `requests`, `limits`, cgroup events, and the collector’s own memory handling can clash, often resulting in sudden OOM kills of the collector process.
+
+## Why This Matters
+When a collector is terminated unexpectedly, telemetry pipelines break, alerts go dark, and incident response drags on. The root cause is rarely a simple mis‑configuration; it is a mismatch between the resource model Kubernetes exposes and the kernel’s low‑level reclaim behavior. Understanding and tuning the right levers can prevent costly downtime without resorting to kernel patches.
+
+## How It Works
+The collector’s memory safety depends on three layers:
+
+1. **Kubernetes resource model** – `requests` and `limits` are translated into cgroup v2 limits (`memory.max`) and low‑water marks (`memory.low`).
+2. **cgroup v2 memory events** – `memory.low`, `memory.high`, `memory.max`, and `memory.min` are kernel signals that drive throttling and OOM triggers.
+3. **Collector internal heuristics** – the Go runtime’s `GOMEMLIMIT` and the ballast extension estimate how much memory can be safely used for buffering.
+
+### Memory Hierarchy and Kill Path
+```mermaid
+flowchart TD
+    subgraph Pod[Pod]
+        A[Container: otelcol]
+        B[Sidecar: app]
+    end
+    subgraph Node[Node (cgroup v2)]
+        C[memory.low] -->|protect| A
+        C -->|throttle| A
+        D[memory.high] -->|throttle| A
+        E[memory.max] -->|hard kill| A
+        F[memory.min] -->|reservation| A
+    end
+    subgraph Collector[OpenTelemetry Collector]
+        G[ballast extension]
+        H[memory_limiter processor]
+    end
+    A -->|uses| G
+    G -->|adjusts| H
+    H -->|spike limit| I[exporter]
+    style Pod fill:#f9f,stroke:#333,stroke-width:2px
+    style Node fill:#bbf,stroke:#333,stroke-width:2px
+    style Collector fill:#fbb,stroke:#333,stroke-width:2px
+```
+
+1. **Pod start** – the kubelet creates a cgroup slice. `memory.max` is derived from the pod’s `limits.memory` (or the node allocatable if unspecified). `memory.min` mirrors the `requests.memory`.
+2. **Collector operation** – the ballast extension monitors `cgroup/memory.max` and subtracts an estimate of page cache usage. It then sets a dynamic ballast size (`OTELCOL_BALLAST_MIB`) that the collector can safely consume.
+3. **Throttling** – when the process exceeds `memory.high`, the kernel throttles CPU and memory bandwidth, causing latency spikes.
+4. **OOM** – if the process crosses `memory.max`, the kernel invokes the OOM killer. The collector’s `oom_score_adj` determines its priority.
+
+### Core Concepts
+- **MemoryQoS classes**: `Guaranteed` → `requests == limits`; `Burstable` → `requests < limits`; `BestEffort` → no limits. `Guaranteed` still does not protect against page‑cache pressure.
+- **cgroup v2 events**: `memory.low` is a soft limit; crossing it triggers throttling but not kill. `memory.max` is the hard boundary; exceeding it results in immediate OOM.
+- **Page cache accounting**: `tmpfs`, `emptyDir`, and `shm` are counted inside the container’s memory limit, often eating the collector’s headroom.
+- **Go runtime `GOMEMLIMIT`**: the collector can set its own limit, but the ballast extension provides a more accurate estimate by factoring cgroup events.
+
+## Core Concepts (continued)
+- **Dynamic ballast** – instead of a static `size_mib`, compute `ballast = min( (limit - request) * 0.8, 2Gi )` at runtime, using the current `cgroup/memory.max` and an estimated page‑cache footprint.
+- **Processor chain** – place a soft `memory_limiter` (triggered at 90 % of ballast) followed by a hard `memory_limiter` (spike mode at 98 %). Use `check_interval` of 100 ms to avoid thrashing.
+- **OOM score adjustment** – inject `oom_score_adj: -997` for DaemonSet collectors and `-500` for sidecars before container start via a mutating admission webhook.
+
+## Examples & Code Walkthrough
+
+### Pattern A: The “Aware” Ballast Extension (Collector Config)
+
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: otelcol
+spec:
+  selector:
+    matchLabels:
+      app: otelcol
+  template:
+    metadata:
+      labels:
+        app: otelcol
+    spec:
+      containers:
+      - name: otelcol
+        image: otel/opentelemetry-collector-contrib:0.110.0
+        args:
+          - "--config=/etc/otel-config.yaml"
+        env:
+        - name: OTEL_COLLECTOR_BALLAST_MIB
+          value: "512"   # set by initContainer below
+        resources:
+          limits:
+            memory: 2Gi
+            cpu: "2"
+          requests:
+            memory: 500Mi
+            cpu: "500m"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/otel-config.yaml
+          subPath: config.yaml
+      initContainers:
+      - name: inject-ballast
+        image: busybox
+        command:
+          - sh
+          - -c
+          - |
+            # Compute dynamic ballast: 0.8 * (limit - request) capped at 2Gi
+            LIMIT=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null || echo "0")
+            # In practice we read the cgroup file directly
+            CGROUP_MAX=$(cat /sys/fs/cgroup/memory/memory.max)
+            REQUEST=$(cat /sys/fs/cgroup/memory/memory.low)
+            BALLIST=$(( (CGROUP_MAX - REQUEST) * 80 / 100 ))
+            BALLIST=$(( BALLIST > 2147483648 ? 2147483648 : BALLIST ))
+            echo "OTEL_COLLECTOR_BALLAST_MIB=$BALLIST" > /etc/otel-ballast.env
+        env:
+        - name: KUBERNETES_SERVICE_HOST
+          value: "kubernetes.default.svc.cluster.local"
+        volumeMounts:
+        - name: ballast-env
+          mountPath: /etc/otel-ballast.env
+          subPath: ballast.env
+      volumes:
+      - name: config
+        configMap:
+          name: otel-collector-config
+      - name: ballast-env
+        emptyDir: {}
+```
+
+**Explanation**  
+- The init container reads `memory.max` and `memory.low` from the cgroupfs, calculates a ballast value that is 80 % of the headroom, and caps it at 2 GiB.  
+- The value is written to an environment file that the collector reads at startup, avoiding static mis‑sizing.
+
+### Pattern B: The “Soft Limit” Processor Chain (OTLP Pipeline)
+
+```yaml
+pipeline:
+  receivers:
+    otlp:
+      port: 4317
+  processors:
+    batch:
+      timeout: 5s
+      send_batch_size: 512
+    memory_limiter:
+      check_interval: 100ms
+      limit_mib: 90%   # soft limit based on ballast
+      spike_limit_mib: 98%   # hard limit for sudden spikes
+      spike_refresh_interval: 10s
+    batch:
+      timeout: 2s
+  exporters:
+    otlp:
+      endpoint: "backend:4317"
+      tls:
+        insecure: true
+```
+
+**Explanation**  
+- The `memory_limiter` processor first applies a soft limit at 90 % of the configured ballast.  
+- If usage exceeds 98 % (spike mode), the processor temporarily expands the limit to accommodate short bursts, then reverts after a 10‑second refresh interval.  
+- This pattern prevents the collector from being throttled or killed during traffic spikes while still protecting the node from runaway memory consumption.
+
+### Pattern C: The Node‑Level “Memory QoS” Guard (Kubernetes Policy)
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: memory-quota-check
+spec:
+  validationFailureAction: Deny
+  rules:
+  - operations: ["CREATE", "UPDATE"]
+    apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+    scope: "*"
+    validationFailurePolicy: "Fail"
+    matchingWholeObject: true
+    parameter:
+      expression: >
+        (request.object.spec.containers[*].resources.limits.memory |
+         # Convert to bytes
+         (request.object.spec.containers[*].resources.limits.memory | 
+          regexp: "^([0-9]+[kMG]?)$" -> int($1) * 1024 * 1024 |
+          # Ensure we stay under 85% of node allocatable
+          (request.object.spec.nodeName | 
+           kubelet_status_node_status_allocatable_memory_bytes) * 85 / 100
+        )
+  - operations: ["CREATE", "UPDATE"]
+    apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+    scope: "*"
+    validationFailurePolicy: "Fail"
+    matchingWholeObject: true
+    parameter:
+      expression: >
+        (request.object.spec.runtimeClassName == "kata") ||
+        (request.object.spec.containers[*].resources.limits.memory |
+         (request.object.spec.containers[*].resources.limits.memory | 
+          regexp: "^([0-9]+[kMG]?)$" -> int($1) * 1024 * 1024 |
+          (request.object.spec.nodeName | 
+           kubelet_status_node_status_allocatable_memory_bytes) * 85 / 100)
+```
+
+**Explanation**  
+- The first rule rejects pods whose memory limit exceeds 85 % of the node’s allocatable memory unless they run in a Kata runtime (which provides VM isolation).  
+- The second rule allows an exception for `kata` runtime classes, acknowledging the reduced memory pressure.  
+- This policy prevents noisy‑neighbor scenarios where a low‑memory pod consumes node resources needed by critical collectors.
+
+## Best Practices
+1. **Calculate ballast dynamically** – never hard‑code a size; derive it from the actual cgroup `memory.max` and an estimated page‑cache footprint.  
+2. **Deploy collectors as DaemonSets** with a high `oom_score_adj` (‑997) to keep them alive even when node memory is tight.  
+3. **Use a two‑stage memory limiter** (soft then spike) to absorb traffic bursts without throttling the pipeline.  
+4. **Validate memory requests against node allocatable** via an admission webhook; 85 % is a safe upper bound for bursty workloads.  
+5. **Monitor `process_resident_memory_bytes` and `otelcol_memory_limit`** metrics; set alerts on sustained >90 % of ballast.
+
+## Common Mistakes & Anti-Patterns
+| Mistake | Why It Fails | Fix |
+|---------|--------------|-----|
+| Setting a static `size_mib` for ballast | Fails on nodes with different `limits.memory`; can over‑commit or under‑utilize memory. | Compute ballast at runtime using cgroup `memory.max` and a configurable safety factor (e.g., 0.8). |
+| Relying only on `memory_limiter` with a single hard limit | The collector may be throttled before the OOM killer fires, causing data loss. | Add a second limiter in spike mode (98 % of ballast) and set `check_interval` to 100 ms. |
+| Forgetting to adjust `oom_score_adj` for DaemonSet collectors | They may be killed preferentially by the node’s OOM daemon. | Set `oom_score_adj: -997` via a mutating webhook or pod security context. |
+| Ignoring page‑cache accounting in `emptyDir` or `shm` | These volumes consume memory that counts against the container limit, leading to unexpected OOM. | Reserve explicit memory limits for `emptyDir` (`emptyDir: {medium: 512Mi}`) or use `hostPath` with `securityContext` to isolate. |
+
+## Performance Considerations
+- **Memory allocation** – The ballast extension adds a small Go routine that reads `/sys/fs/cgroup/...` every 5 seconds; CPU overhead is <0.1 % on typical workloads.  
+- **Latency** – The soft limiter operates on the same pipeline
